@@ -20,6 +20,11 @@ if [ ! -f "./envd" ]; then
     exit 1
 fi
 
+if [ ! -f "./sandbox-runtime-storage" ]; then
+    echo "Error: sandbox-runtime-storage file not found in current directory" >&2
+    exit 1
+fi
+
 # Copy files to target directory with error checking
 cp ./envd-run.sh "$ENVD_DIR/" || {
     echo "Error: Failed to copy envd-run.sh to $ENVD_DIR" >&2
@@ -31,6 +36,11 @@ cp ./envd "$ENVD_DIR/" || {
     exit 1
 }
 
+cp ./sandbox-runtime-storage "$ENVD_DIR/" || {
+    echo "Error: Failed to copy sandbox-runtime-storage to $ENVD_DIR" >&2
+    exit 1
+}
+
 chmod +x "$ENVD_DIR/envd-run.sh" || {
     echo "Error: Failed to make $ENVD_DIR/envd-run.sh executable" >&2
     exit 1
@@ -38,6 +48,11 @@ chmod +x "$ENVD_DIR/envd-run.sh" || {
 
 chmod +x "$ENVD_DIR/envd" || {
     echo "Error: Failed to make $ENVD_DIR/envd executable" >&2
+    exit 1
+}
+
+chmod +x "$ENVD_DIR/sandbox-runtime-storage" || {
+    echo "Error: Failed to make $ENVD_DIR/sandbox-runtime-storage executable" >&2
     exit 1
 }
 

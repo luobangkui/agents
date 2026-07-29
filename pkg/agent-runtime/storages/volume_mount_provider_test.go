@@ -67,6 +67,7 @@ func TestMountProvider_GenerateNodePublishVolumeRequest(t *testing.T) {
 				assert.Equal(t, "/var/lib/kubelet/pods/abc/volumes/kubernetes.io~csi/pvc-123/mount", result.TargetPath)
 				assert.NotNil(t, result.VolumeCapability)
 				assert.False(t, result.Readonly)
+				assert.Equal(t, "/run/cnfs/alinas-mounter.sock", result.PublishContext["mountPorxySocket"])
 				assert.NotNil(t, result.VolumeContext)
 				assert.Equal(t, "ext4", result.VolumeContext["type"])
 			},

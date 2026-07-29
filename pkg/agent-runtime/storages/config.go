@@ -27,7 +27,11 @@ type initProviderFunc func(*StorageProvider)
 
 var (
 	initializeProviderFuncs = []initProviderFunc{}
-	driversConfig           = map[string]string{}
+	driversConfig           = map[string]string{
+		// Alibaba OSS/NAS CSI keeps this misspelled publish-context key for compatibility.
+		// The mount proxy in the injected CSI runtime listens on the matching shared socket.
+		"mountPorxySocket": "/run/cnfs/alinas-mounter.sock",
+	}
 )
 
 func init() {
