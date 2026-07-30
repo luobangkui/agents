@@ -17,6 +17,8 @@ limitations under the License.
 package config
 
 import (
+	"time"
+
 	"github.com/google/uuid"
 )
 
@@ -32,12 +34,18 @@ func NewDefaultAccessToken() string {
 	return uuid.NewString()
 }
 
-const DefaultCSIMountConcurrency = 3
+const (
+	DefaultCSIMountConcurrency = 3
+	DefaultCSIMountTimeout     = 30 * time.Second
+)
 
 type CSIMountOptions struct {
 	MountOptionList    []MountConfig `json:"mountOptionList"`
-	MountOptionListRaw string        `json:"mountOptionListRaw"`    // the raw json string for mount options
-	Concurrency        int           `json:"concurrency,omitempty"` // max concurrent CSI mount operations, 0 or negative means unlimited, default is DefaultCSIMountConcurrency
+	MountOptionListRaw string        `json:"mountOptionListRaw"` // the raw JSON string for mount options
+	// Concurrency limits concurrent CSI mounts. Non-positive values use DefaultCSIMountConcurrency.
+	Concurrency int `json:"concurrency,omitempty"`
+	// Timeout limits one CSI mount. Non-positive values use DefaultCSIMountTimeout.
+	Timeout time.Duration `json:"timeout,omitempty"`
 }
 
 type MountConfig struct {

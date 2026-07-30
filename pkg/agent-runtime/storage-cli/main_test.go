@@ -25,12 +25,14 @@ import (
 	"log"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/golang/protobuf/proto"
 	"github.com/openkruise/agents/pkg/agent-runtime/storage-cli/storage"
 	"github.com/spf13/cobra"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // TestGetMD5String verifies that getMD5String produces the canonical
@@ -81,6 +83,48 @@ func TestGetMD5String_Deterministic(t *testing.T) {
 	for i := 0; i < 5; i++ {
 		assert.Equal(t, first, getMD5String(input))
 	}
+}
+
+func TestGetMountTargetHash(t *testing.T) {
+	base := csi.NodePublishVolumeRequest{
+		VolumeId:   "shared-oss-pv",
+		TargetPath: "/bohr-workspace",
+		VolumeContext: map[string]string{
+			"bucket":                     "bohr-sandbox-test",
+			"path":                       "/bohr-sandbox/users/1/session-a",
+			"csi.storage.k8s.io/pod.uid": "pod-a",
+		},
+	}
+
+	t.Run("stable across map order and pod identity", func(t *testing.T) {
+		other := base
+		other.VolumeContext = map[string]string{
+			"csi.storage.k8s.io/pod.uid": "pod-b",
+			"path":                       "/bohr-sandbox/users/1/session-a",
+			"bucket":                     "bohr-sandbox-test",
+		}
+		assert.Equal(t, getMountTargetHash("oss.csi.example.com", base),
+			getMountTargetHash("oss.csi.example.com", other))
+	})
+
+	t.Run("different session path uses different host mount", func(t *testing.T) {
+		other := base
+		other.VolumeContext = map[string]string{
+			"bucket": "bohr-sandbox-test",
+			"path":   "/bohr-sandbox/users/1/session-b",
+		}
+		assert.NotEqual(t, getMountTargetHash("oss.csi.example.com", base),
+			getMountTargetHash("oss.csi.example.com", other))
+	})
+
+	t.Run("driver and volume are part of identity", func(t *testing.T) {
+		other := base
+		other.VolumeId = "another-pv"
+		assert.NotEqual(t, getMountTargetHash("oss.csi.example.com", base),
+			getMountTargetHash("oss.csi.example.com", other))
+		assert.NotEqual(t, getMountTargetHash("oss.csi.example.com", base),
+			getMountTargetHash("nas.csi.example.com", base))
+	})
 }
 
 // TestValidateGeneralParams_ExpectError mirrors the existing wantErr-style
@@ -226,8 +270,8 @@ func TestCommandMetadata(t *testing.T) {
 	}
 }
 
-// TestRootCmdPersistentFlags verifies the two CLI-contract flags are wired
-// onto the root command with the expected long and short names.
+// TestRootCmdPersistentFlags verifies the CLI-contract flags are wired onto
+// the root command with the expected long and short names.
 func TestRootCmdPersistentFlags(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -236,6 +280,7 @@ func TestRootCmdPersistentFlags(t *testing.T) {
 	}{
 		{name: "driver flag", long: "driver", shorthand: "d"},
 		{name: "config flag", long: "config", shorthand: "c"},
+		{name: "timeout flag", long: "timeout", shorthand: ""},
 	}
 
 	for _, tt := range tests {
@@ -391,14 +436,17 @@ func makeBase64CSIConfig(t *testing.T, req *csi.NodePublishVolumeRequest) string
 func withRunMountEnv(t *testing.T, d, cfg, mn string) {
 	t.Helper()
 	origDriver, origConfig, origMountName := driver, config, mountName
+	origMountTimeout := mountTimeout
 	origMountFinderFn := mountFinderFn
 	origStorageLookupFn := storageLookupFn
 	origCreateSymlinkFn := createSymlinkFn
 	driver, config, mountName = d, cfg, mn
+	mountTimeout = storage.DefaultNodePublishVolumeTimeout
 	t.Cleanup(func() {
 		driver = origDriver
 		config = origConfig
 		mountName = origMountName
+		mountTimeout = origMountTimeout
 		mountFinderFn = origMountFinderFn
 		storageLookupFn = origStorageLookupFn
 		createSymlinkFn = origCreateSymlinkFn
@@ -614,4 +662,35 @@ func TestRunMount_PodUIDFromEnv(t *testing.T) {
 	assert.NoError(t, runMount(silentCmd()))
 }
 
+func TestRunMountPassesConfiguredTimeout(t *testing.T) {
+	req := &csi.NodePublishVolumeRequest{
+		TargetPath: "/bohr-workspace",
+		VolumeContext: map[string]string{
+			"csi.storage.k8s.io/pod.uid": "test-pod-uid",
+		},
+	}
+	withRunMountEnv(t, "ossplugin.csi.alibabacloud.com", makeBase64CSIConfig(t, req), "mount-root")
+	mountTimeout = 75 * time.Second
+	log.SetOutput(io.Discard)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
 
+	mountFinderFn = func(_ string, _ bool) (string, error) { return "/fake/root", nil }
+	storageLookupFn = func(_ string) (storage.Provider, bool) {
+		return &fakeProvider{
+			driverName: "ossplugin.csi.alibabacloud.com",
+			subDir:     "oss",
+			mountFn: func(ctx context.Context, _ csi.NodePublishVolumeRequest) error {
+				deadline, ok := ctx.Deadline()
+				require.True(t, ok)
+				assert.Greater(t, time.Until(deadline), 70*time.Second)
+				return nil
+			},
+		}, true
+	}
+	createSymlinkFn = func(_, linkPath string) error {
+		assert.Equal(t, "/bohr-workspace", linkPath)
+		return nil
+	}
+
+	assert.NoError(t, runMount(silentCmd()))
+}

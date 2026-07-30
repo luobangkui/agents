@@ -24,6 +24,7 @@ import (
 	"log"
 	"os"
 	"path"
+	"sort"
 	"strings"
 	"time"
 
@@ -36,12 +37,12 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// Only two flags are required by the CLI contract.
 var (
-	driver    string // driver name
-	config    string // mount configuration for the chosen storage driver
-	mountName string // name of the shared mount-root volume; defaults to "mount-root"
-	debugMode bool   // when true, sensitive fields such as PublishContext are included in log output
+	driver       string // driver name
+	config       string // mount configuration for the chosen storage driver
+	mountName    string // name of the shared mount-root volume; defaults to "mount-root"
+	debugMode    bool   // when true, sensitive fields such as PublishContext are included in log output
+	mountTimeout time.Duration
 )
 
 func init() {
@@ -49,6 +50,8 @@ func init() {
 	rootCmd.PersistentFlags().StringVarP(&config, "config", "c", "", "(base64) specified storage mount config for nas or oss")
 	rootCmd.PersistentFlags().StringVarP(&mountName, "mount-name", "m", "mount-root", "name of the shared mount-root volume used to locate the real mount path")
 	rootCmd.PersistentFlags().BoolVar(&debugMode, "debug", false, "include sensitive fields (e.g. PublishContext) in log output; use only in non-production environments")
+	rootCmd.PersistentFlags().DurationVar(&mountTimeout, "timeout", storage.DefaultNodePublishVolumeTimeout,
+		"timeout for a single CSI NodePublishVolume request")
 }
 
 var version = "unknown" // set via -ldflags at build time
@@ -82,6 +85,10 @@ func rootRun(cmd *cobra.Command, args []string) {
 // error instead of calling os.Exit so that it can be exercised directly by
 // unit tests. mountRun is the thin cobra handler that calls os.Exit on error.
 func runMount(cmd *cobra.Command) error {
+	if mountTimeout <= 0 {
+		return fmt.Errorf("mount timeout must be greater than 0")
+	}
+
 	configRaw, err := base64.StdEncoding.DecodeString(config)
 	if err != nil {
 		cmd.Help() // #nosec G104 -- help output error is non-actionable
@@ -112,8 +119,8 @@ func runMount(cmd *cobra.Command) error {
 	}
 
 	originDirectory := csiReq.TargetPath
-	originDirectoryMd5 := getMD5String(csiReq.TargetPath)
-	log.Printf("Origin directory: %s, md5: %s", originDirectory, originDirectoryMd5)
+	mountTargetHash := getMountTargetHash(driver, csiReq)
+	log.Printf("Origin directory: %s, mount target hash: %s", originDirectory, mountTargetHash)
 
 	mountRootPath, err := mountFinderFn(mountName, debugMode)
 	if err != nil {
@@ -132,11 +139,17 @@ func runMount(cmd *cobra.Command) error {
 		return err
 	}
 
-	toMountTargetPath := path.Join(mountRootPath, provider.SubDir(), originDirectoryMd5)
+	toMountTargetPath := path.Join(mountRootPath, provider.SubDir(), mountTargetHash)
 	log.Printf("Real mount target path: %s", toMountTargetPath)
 	csiReq.TargetPath = toMountTargetPath
 
-	if err = provider.Mount(context.Background(), csiReq, debugMode); err != nil {
+	parentCtx := cmd.Context()
+	if parentCtx == nil {
+		parentCtx = context.Background()
+	}
+	mountCtx, cancel := context.WithTimeout(parentCtx, mountTimeout)
+	defer cancel()
+	if err = provider.Mount(mountCtx, csiReq, debugMode); err != nil {
 		return fmt.Errorf("mount failed for driver %s: %w", driver, err)
 	}
 
@@ -210,4 +223,41 @@ func getMD5String(s string) string {
 	h := md5.New()     // #nosec G401 -- non-security short hash
 	h.Write([]byte(s)) // #nosec G104 -- hash.Write never returns error
 	return fmt.Sprintf("%x", h.Sum(nil))
+}
+
+// getMountTargetHash identifies the real host mount by storage semantics, not
+// only by the container-visible target path. Pooled sandboxes commonly reuse
+// /bohr-workspace while changing the OSS path for every session. Hashing only
+// TargetPath would make those sessions share one host FUSE mount.
+func getMountTargetHash(driverName string, req csi.NodePublishVolumeRequest) string {
+	fields := []string{driverName, req.VolumeId, req.TargetPath, fmt.Sprintf("%t", req.Readonly)}
+	keys := make([]string, 0, len(req.VolumeContext))
+	for key := range req.VolumeContext {
+		if isPodIdentityVolumeContextKey(key) {
+			continue
+		}
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		fields = append(fields, key, req.VolumeContext[key])
+	}
+
+	var identity strings.Builder
+	for _, field := range fields {
+		fmt.Fprintf(&identity, "%d:%s;", len(field), field)
+	}
+	return getMD5String(identity.String())
+}
+
+func isPodIdentityVolumeContextKey(key string) bool {
+	switch key {
+	case "csi.storage.k8s.io/pod.name",
+		"csi.storage.k8s.io/pod.namespace",
+		"csi.storage.k8s.io/pod.uid",
+		"csi.storage.k8s.io/serviceAccount.name":
+		return true
+	default:
+		return false
+	}
 }

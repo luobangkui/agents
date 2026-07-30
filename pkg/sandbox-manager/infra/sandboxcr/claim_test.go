@@ -720,6 +720,21 @@ func TestInfra_ClaimSandbox(t *testing.T) {
 	}
 }
 
+func TestCSIMountContextSurvivesCallerCancellation(t *testing.T) {
+	type contextKey string
+	const key contextKey = "request-id"
+
+	parent, cancel := context.WithCancel(context.WithValue(t.Context(), key, "request-123"))
+	mountCtx := csiMountContext(parent)
+	cancel()
+
+	require.ErrorIs(t, parent.Err(), context.Canceled)
+	require.NoError(t, mountCtx.Err())
+	assert.Equal(t, "request-123", mountCtx.Value(key))
+	_, hasDeadline := mountCtx.Deadline()
+	assert.False(t, hasDeadline, "the storage command owns the bounded mount deadline")
+}
+
 //goland:noinspection GoDeprecation
 func TestClaimSandboxFailed(t *testing.T) {
 	opts := testutils.TestRuntimeServerOptions{

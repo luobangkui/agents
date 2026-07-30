@@ -52,12 +52,12 @@ func (c *nopCloser) Close() error {
 type fakeNodeClient struct {
 	csi.NodeClient
 
-	gotReq  *csi.NodePublishVolumeRequest
-	gotCtx  context.Context
-	resp    *csi.NodePublishVolumeResponse
-	err     error
-	calls   atomic.Int32
-	onCall  func(ctx context.Context)
+	gotReq *csi.NodePublishVolumeRequest
+	gotCtx context.Context
+	resp   *csi.NodePublishVolumeResponse
+	err    error
+	calls  atomic.Int32
+	onCall func(ctx context.Context)
 }
 
 func (f *fakeNodeClient) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolumeRequest, _ ...grpc.CallOption) (*csi.NodePublishVolumeResponse, error) {
@@ -169,8 +169,8 @@ func TestRunNodePublishVolume(t *testing.T) {
 	}
 }
 
-// TestRunNodePublishVolumeAppliesTimeout verifies that the per-call timeout
-// derived from nodePublishVolumeTimeout is layered on top of the parent ctx.
+// TestRunNodePublishVolumeAppliesTimeout verifies that the default per-call
+// timeout is added when the parent context has no deadline.
 func TestRunNodePublishVolumeAppliesTimeout(t *testing.T) {
 	fake := &fakeNodeClient{
 		resp: &csi.NodePublishVolumeResponse{},
@@ -185,6 +185,26 @@ func TestRunNodePublishVolumeAppliesTimeout(t *testing.T) {
 	})
 
 	err := RunNodePublishVolume(context.Background(), "fake.csi.example.com", csi.NodePublishVolumeRequest{}, false)
+	assert.NoError(t, err)
+	assert.Equal(t, int32(1), fake.calls.Load())
+}
+
+func TestRunNodePublishVolumePreservesParentDeadline(t *testing.T) {
+	fake := &fakeNodeClient{
+		resp: &csi.NodePublishVolumeResponse{},
+		onCall: func(ctx context.Context) {
+			deadline, ok := ctx.Deadline()
+			assert.True(t, ok)
+			assert.Greater(t, time.Until(deadline), 50*time.Second)
+		},
+	}
+	withClientFactory(t, func(_ string) (csi.NodeClient, io.Closer, error) {
+		return fake, &nopCloser{}, nil
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	err := RunNodePublishVolume(ctx, "fake.csi.example.com", csi.NodePublishVolumeRequest{}, false)
 	assert.NoError(t, err)
 	assert.Equal(t, int32(1), fake.calls.Load())
 }

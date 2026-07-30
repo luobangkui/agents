@@ -30,8 +30,8 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 )
 
-// nodePublishVolumeTimeout is the upper bound for a single CSI mount RPC.
-const nodePublishVolumeTimeout = 30 * time.Second
+// DefaultNodePublishVolumeTimeout is used when the caller does not provide a deadline.
+const DefaultNodePublishVolumeTimeout = 30 * time.Second
 
 // newClientFn is the indirection used by RunNodePublishVolume to obtain a
 // CSI NodeClient + a Closer for the underlying connection. It is a package
@@ -67,7 +67,11 @@ func RunNodePublishVolume(ctx context.Context, driver string, req csi.NodePublis
 		log.Printf("[DEBUG] NodePublishVolume publishContext: driver=%s publishContext=%v", driver, req.PublishContext)
 	}
 
-	callCtx, cancel := context.WithTimeout(ctx, nodePublishVolumeTimeout)
+	callCtx := ctx
+	cancel := func() {}
+	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+		callCtx, cancel = context.WithTimeout(ctx, DefaultNodePublishVolumeTimeout)
+	}
 	defer cancel()
 
 	start := time.Now()

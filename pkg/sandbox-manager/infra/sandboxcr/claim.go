@@ -373,7 +373,19 @@ func runClaimPostProcesses(ctx context.Context, sbx *Sandbox, lockType infra.Loc
 	if opts.CSIMount != nil {
 		log.Info("starting to perform csi mount")
 		var err error
-		metrics.CSIMount, err = runtime.ProcessCSIMounts(ctx, sbx.Sandbox, *opts.CSIMount)
+		// A CSI mount changes host state and must finish (or hit its own bounded
+		// timeout) even when the upstream HTTP client disconnects. In
+		// particular, the public sandbox API currently has a shorter client
+		// timeout than a cold OSS mount. Propagating that cancellation leaves a
+		// half-finished FUSE operation and makes the longer CSI timeout
+		// ineffective.
+		//
+		// WithoutCancel preserves request-scoped values used by logging while
+		// removing only the caller cancellation/deadline. ProcessCSIMounts and
+		// sandbox-runtime-storage still enforce the configured per-mount
+		// timeout.
+		mountCtx := csiMountContext(ctx)
+		metrics.CSIMount, err = runtime.ProcessCSIMounts(mountCtx, sbx.Sandbox, *opts.CSIMount)
 		if err != nil {
 			log.Error(err, "failed to perform csi mount")
 			return fmt.Errorf("failed to perform csi mount: %s", err)
@@ -383,6 +395,10 @@ func runClaimPostProcesses(ctx context.Context, sbx *Sandbox, lockType infra.Loc
 	}
 
 	return nil
+}
+
+func csiMountContext(ctx context.Context) context.Context {
+	return context.WithoutCancel(ctx)
 }
 
 // clearFailedSandbox cleans up (or reserves) a failed sandbox according to

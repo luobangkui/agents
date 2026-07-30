@@ -18,6 +18,7 @@ package config
 
 import (
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
@@ -37,4 +38,8 @@ func TestNewDefaultAccessToken(t *testing.T) {
 
 func TestDefaultCSIMountConcurrency(t *testing.T) {
 	assert.Equal(t, 3, DefaultCSIMountConcurrency, "default CSI mount concurrency should be 3")
+}
+
+func TestDefaultCSIMountTimeout(t *testing.T) {
+	assert.Equal(t, 30*time.Second, DefaultCSIMountTimeout, "default CSI mount timeout should be 30 seconds")
 }

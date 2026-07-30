@@ -89,7 +89,12 @@ func TestCSIMount(t *testing.T) {
 			startFn: func(ctx context.Context, req *connect.Request[process.StartRequest], stream *connect.ServerStream[process.StartResponse]) error {
 				// Verify the process config
 				assert.Equal(t, MountCommand, req.Msg.Process.Cmd)
-				assert.Equal(t, []string{"mount", "--driver", "nfs", "--config", `{"path":"/mnt/data"}`}, req.Msg.Process.Args)
+				assert.Equal(t, []string{
+					"mount",
+					"--driver", "nfs",
+					"--config", `{"path":"/mnt/data"}`,
+					"--timeout", "30s",
+				}, req.Msg.Process.Args)
 				assert.Equal(t, "test-pod-uid", req.Msg.Process.Envs["POD_UID"])
 
 				// Send start event
@@ -234,6 +239,51 @@ func TestCSIMount(t *testing.T) {
 			require.NoError(t, err)
 		})
 	}
+}
+
+func TestCSIMountUsesConfiguredTimeout(t *testing.T) {
+	originalTimeout := csiMountTimeout
+	csiMountTimeout = 75 * time.Second
+	t.Cleanup(func() { csiMountTimeout = originalTimeout })
+
+	handler := &mockProcessHandler{
+		startFn: func(
+			_ context.Context,
+			req *connect.Request[process.StartRequest],
+			stream *connect.ServerStream[process.StartResponse],
+		) error {
+			assert.Equal(t, []string{
+				"mount",
+				"--driver", "ossplugin.csi.alibabacloud.com",
+				"--config", "encoded-request",
+				"--timeout", "1m15s",
+			}, req.Msg.Process.Args)
+			if err := stream.Send(&process.StartResponse{
+				Event: &process.ProcessEvent{
+					Event: &process.ProcessEvent_Start{
+						Start: &process.ProcessEvent_StartEvent{Pid: 42},
+					},
+				},
+			}); err != nil {
+				return err
+			}
+			return stream.Send(&process.StartResponse{
+				Event: &process.ProcessEvent{
+					Event: &process.ProcessEvent_End{
+						End: &process.ProcessEvent_EndEvent{ExitCode: 0, Exited: true},
+					},
+				},
+			})
+		},
+	}
+	_, sbx := newMockRuntimeServer(t, handler)
+
+	require.NoError(t, CSIMount(
+		context.Background(),
+		sbx,
+		"ossplugin.csi.alibabacloud.com",
+		"encoded-request",
+	))
 }
 
 func TestProcessCSIMounts(t *testing.T) {
@@ -647,7 +697,12 @@ func TestDoCSIMount(t *testing.T) {
 			handler := &mockProcessHandler{startFn: tt.startFn}
 			_, sbx := newMockRuntimeServer(t, handler)
 
-			duration, err := doCSIMount(context.Background(), sbx, tt.opts)
+			duration, err := doCSIMount(
+				context.Background(),
+				sbx,
+				tt.opts,
+				30*time.Second,
+			)
 			if tt.wantErr {
 				require.Error(t, err)
 				return

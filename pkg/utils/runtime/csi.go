@@ -19,6 +19,7 @@ package runtime
 import (
 	"context"
 	"errors"
+	"flag"
 	"fmt"
 	"sync"
 	"time"
@@ -33,20 +34,43 @@ import (
 
 var MountCommand = "/mnt/envd/sandbox-runtime-storage"
 
+// csiMountTimeout is process-wide because claim, clone, and resume paths share
+// the same runtime command and must use one operational timeout.
+var csiMountTimeout = config.DefaultCSIMountTimeout
+
+func init() {
+	flag.DurationVar(&csiMountTimeout, "csi-mount-timeout", config.DefaultCSIMountTimeout,
+		"Timeout for a single dynamic CSI mount operation.")
+}
+
 // CSIMount creates a dynamic mount point in Sandbox with `sandbox-storage` cli.
 // It accepts the raw Sandbox API object to avoid circular dependency on the sandboxcr package.
 //
 // NOTE: `sandbox-storage` cli should be injected with `sandbox-runtime` and will be replaced by a built-in service of
 // `sandbox-runtime`.
 func CSIMount(ctx context.Context, sbx *agentsv1alpha1.Sandbox, driver string, request string) error {
+	return csiMount(ctx, sbx, driver, request, csiMountTimeout)
+}
+
+func csiMount(
+	ctx context.Context,
+	sbx *agentsv1alpha1.Sandbox,
+	driver string,
+	request string,
+	timeout time.Duration,
+) error {
 	log := klog.FromContext(ctx).WithValues("sandbox", klog.KObj(sbx))
 	startTime := time.Now()
+	if timeout <= 0 {
+		timeout = config.DefaultCSIMountTimeout
+	}
 	processConfig := &process.ProcessConfig{
 		Cmd: MountCommand,
 		Args: []string{
 			"mount",
 			"--driver", driver,
 			"--config", request,
+			"--timeout", timeout.String(),
 		},
 		Cwd: nil,
 		Envs: map[string]string{
@@ -57,7 +81,7 @@ func CSIMount(ctx context.Context, sbx *agentsv1alpha1.Sandbox, driver string, r
 	result, err := RunCommandWithRuntime(ctx, RunCmdFuncArgs{
 		Sbx:           sbx,
 		ProcessConfig: processConfig,
-		Timeout:       30 * time.Second,
+		Timeout:       timeout,
 	})
 	if err != nil {
 		log.Error(err, "failed to run command", "stdout", result.Stdout, "stderr", result.Stderr)
@@ -88,6 +112,10 @@ func ProcessCSIMounts(ctx context.Context, sbx *agentsv1alpha1.Sandbox, opts con
 	if concurrency <= 0 {
 		concurrency = config.DefaultCSIMountConcurrency
 	}
+	timeout := opts.Timeout
+	if timeout <= 0 {
+		timeout = csiMountTimeout
+	}
 	sem := make(chan struct{}, concurrency)
 
 	for _, opt := range opts.MountOptionList {
@@ -96,7 +124,7 @@ func ProcessCSIMounts(ctx context.Context, sbx *agentsv1alpha1.Sandbox, opts con
 		go func(opt config.MountConfig) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			mountDuration, err := doCSIMount(ctx, sbx, opt)
+			mountDuration, err := doCSIMount(ctx, sbx, opt, timeout)
 			if err != nil {
 				log.Error(err, "failed to perform CSI mount", "mountOptionConfig", opt)
 				errCh <- err
@@ -118,9 +146,14 @@ func ProcessCSIMounts(ctx context.Context, sbx *agentsv1alpha1.Sandbox, opts con
 	return time.Since(start), errors.Join(errs...)
 }
 
-func doCSIMount(ctx context.Context, sbx *agentsv1alpha1.Sandbox, opts config.MountConfig) (time.Duration, error) {
+func doCSIMount(
+	ctx context.Context,
+	sbx *agentsv1alpha1.Sandbox,
+	opts config.MountConfig,
+	timeout time.Duration,
+) (time.Duration, error) {
 	ctx = logs.Extend(ctx, "action", "csiMount")
 	start := time.Now()
-	err := CSIMount(ctx, sbx, opts.Driver, opts.RequestRaw)
+	err := csiMount(ctx, sbx, opts.Driver, opts.RequestRaw, timeout)
 	return time.Since(start), err
 }
