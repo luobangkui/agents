@@ -694,3 +694,10 @@ func TestRunMountPassesConfiguredTimeout(t *testing.T) {
 
 	assert.NoError(t, runMount(silentCmd()))
 }
+
+func TestBuiltinStorageProviders(t *testing.T) {
+	assert.ElementsMatch(t, []string{
+		"nasplugin.csi.alibabacloud.com",
+		"ossplugin.csi.alibabacloud.com",
+	}, storage.Drivers())
+}

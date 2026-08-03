@@ -33,6 +33,7 @@ import (
 	"github.com/openkruise/agents/pkg/agent-runtime/storage-cli/link"
 	"github.com/openkruise/agents/pkg/agent-runtime/storage-cli/mountfinder"
 	"github.com/openkruise/agents/pkg/agent-runtime/storage-cli/storage"
+	_ "github.com/openkruise/agents/pkg/agent-runtime/storage-cli/storage/nas"
 	_ "github.com/openkruise/agents/pkg/agent-runtime/storage-cli/storage/oss"
 	"github.com/spf13/cobra"
 )
