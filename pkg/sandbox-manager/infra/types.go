@@ -40,6 +40,15 @@ type SandboxAdmission struct {
 	Release func(ctx context.Context, lockString string) error
 }
 
+// StaticPVCMount is a protocol-neutral description of an existing PVC that
+// must be mounted into a freshly created sandbox.
+type StaticPVCMount struct {
+	ClaimName string `json:"claimName"`
+	MountPath string `json:"mountPath"`
+	SubPath   string `json:"subPath,omitempty"`
+	ReadOnly  bool   `json:"readOnly,omitempty"`
+}
+
 const SandboxAdmissionReleaseTimeout = 250 * time.Millisecond
 
 type ClaimSandboxOptions struct {
@@ -75,6 +84,12 @@ type ClaimSandboxOptions struct {
 	WaitReadyTimeout time.Duration `json:"waitReadyTimeout"`
 	// Create a Sandbox instance from the template if no available ones in SandboxSets
 	CreateOnNoStock bool `json:"createOnNoStock"`
+	// RequireFresh bypasses pooled and speculative candidates and creates a new
+	// Sandbox instance from the SandboxSet. It requires CreateOnNoStock.
+	RequireFresh bool `json:"requireFresh"`
+	// StaticPVCMounts are existing PVCs injected into the new Sandbox pod template.
+	// They are supported only together with RequireFresh.
+	StaticPVCMounts []StaticPVCMount `json:"staticPVCMounts,omitempty"`
 	// A creating sandbox lasts for SpeculateCreatingDuration may be picked as a candidate when no available ones in SandboxSets.
 	// Set to 0 to disable speculation feature
 	SpeculateCreatingDuration time.Duration `json:"speculateCreatingDuration"`

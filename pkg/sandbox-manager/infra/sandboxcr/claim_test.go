@@ -4015,15 +4015,31 @@ func TestNewSandboxFromSandboxSet_TemplateRef(t *testing.T) {
 	const refName = "my-sbt"
 
 	tests := []struct {
-		name       string
-		createSBT  bool
-		wantErr    string
-		wantLabels map[string]string
-		wantAnnos  map[string]string
+		name        string
+		createSBT   bool
+		wantErr     string
+		wantLabels  map[string]string
+		wantAnnos   map[string]string
+		staticMount bool
 	}{
 		{
 			name:      "templateRef resolved and labels inherited",
 			createSBT: true,
+			wantLabels: map[string]string{
+				"app":                          "from-sbt",
+				v1alpha1.LabelSandboxTemplate:  refName,
+				v1alpha1.LabelSandboxPool:      templateName,
+				v1alpha1.LabelSandboxIsClaimed: "false",
+			},
+			wantAnnos: map[string]string{
+				"source":                           "sbt",
+				v1alpha1.SandboxAnnotationPriority: "100",
+			},
+		},
+		{
+			name:        "templateRef is materialized for static PVC",
+			createSBT:   true,
+			staticMount: true,
 			wantLabels: map[string]string{
 				"app":                          "from-sbt",
 				v1alpha1.LabelSandboxTemplate:  refName,
@@ -4054,8 +4070,11 @@ func TestNewSandboxFromSandboxSet_TemplateRef(t *testing.T) {
 					Namespace: "default",
 				},
 				Spec: v1alpha1.SandboxSetSpec{
+					PersistentContents: []string{"filesystem"},
+					Runtimes:           []v1alpha1.RuntimeConfig{{Name: v1alpha1.RuntimeConfigForInjectAgentRuntime}},
 					EmbeddedSandboxTemplate: v1alpha1.EmbeddedSandboxTemplate{
-						TemplateRef: &v1alpha1.SandboxTemplateRef{Name: refName},
+						TemplateRef:          &v1alpha1.SandboxTemplateRef{Name: refName},
+						VolumeClaimTemplates: []corev1.PersistentVolumeClaim{{ObjectMeta: metav1.ObjectMeta{Name: "scratch"}}},
 					},
 				},
 			}
@@ -4099,6 +4118,9 @@ func TestNewSandboxFromSandboxSet_TemplateRef(t *testing.T) {
 				Template: templateName,
 				User:     "test-user",
 			}
+			if tt.staticMount {
+				opts.StaticPVCMounts = []infra.StaticPVCMount{{ClaimName: "wenyon-data", MountPath: "/mnt/wenyon"}}
+			}
 			sbx, _, err := newSandboxFromSandboxSet(t.Context(), opts, infraInstance.Cache)
 
 			if tt.wantErr != "" {
@@ -4116,9 +4138,186 @@ func TestNewSandboxFromSandboxSet_TemplateRef(t *testing.T) {
 			for k, v := range tt.wantAnnos {
 				assert.Equal(t, v, sbx.GetAnnotations()[k], "annotation %s mismatch", k)
 			}
-			// templateRef must be carried over to the Sandbox spec.
-			require.NotNil(t, sbx.Spec.TemplateRef)
-			assert.Equal(t, refName, sbx.Spec.TemplateRef.Name)
+			if tt.staticMount {
+				assert.Nil(t, sbx.Spec.TemplateRef)
+				require.NotNil(t, sbx.Spec.Template)
+				require.Len(t, sbx.Spec.Template.Spec.Volumes, 1)
+				assert.Equal(t, "wenyon-data", sbx.Spec.Template.Spec.Volumes[0].PersistentVolumeClaim.ClaimName)
+				assert.Equal(t, []string{"filesystem"}, sbx.Spec.PersistentContents)
+				assert.Equal(t, []v1alpha1.RuntimeConfig{{Name: v1alpha1.RuntimeConfigForInjectAgentRuntime}}, sbx.Spec.Runtimes)
+				require.Len(t, sbx.Spec.VolumeClaimTemplates, 1)
+				assert.Equal(t, "scratch", sbx.Spec.VolumeClaimTemplates[0].Name)
+			} else {
+				// templateRef must be carried over to the Sandbox spec.
+				require.NotNil(t, sbx.Spec.TemplateRef)
+				assert.Equal(t, refName, sbx.Spec.TemplateRef.Name)
+			}
+		})
+	}
+}
+
+func TestInjectStaticPVCMounts(t *testing.T) {
+	tests := []struct {
+		name       string
+		sandbox    *v1alpha1.Sandbox
+		mounts     []infra.StaticPVCMount
+		wantErr    string
+		wantTarget int
+	}{
+		{
+			name: "injects into named sandbox container and disables recycle",
+			sandbox: &v1alpha1.Sandbox{
+				ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{
+					v1alpha1.AnnotationCleanupEnabled: v1alpha1.True,
+					"example.com/preserved":           "value",
+				}},
+				Spec: v1alpha1.SandboxSpec{EmbeddedSandboxTemplate: v1alpha1.EmbeddedSandboxTemplate{Template: &corev1.PodTemplateSpec{
+					Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "sidecar"}, {Name: "sandbox"}}},
+				}}},
+			},
+			mounts:     []infra.StaticPVCMount{{ClaimName: "data", MountPath: "/mnt/data", SubPath: "job", ReadOnly: true}},
+			wantTarget: 1,
+		},
+		{
+			name: "falls back to first container",
+			sandbox: &v1alpha1.Sandbox{Spec: v1alpha1.SandboxSpec{EmbeddedSandboxTemplate: v1alpha1.EmbeddedSandboxTemplate{Template: &corev1.PodTemplateSpec{
+				Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "main"}, {Name: "sidecar"}}},
+			}}}},
+			mounts: []infra.StaticPVCMount{{ClaimName: "data", MountPath: "/mnt/data"}},
+		},
+		{
+			name: "rejects template mount path conflict",
+			sandbox: &v1alpha1.Sandbox{Spec: v1alpha1.SandboxSpec{EmbeddedSandboxTemplate: v1alpha1.EmbeddedSandboxTemplate{Template: &corev1.PodTemplateSpec{
+				Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "sandbox", VolumeMounts: []corev1.VolumeMount{{Name: "existing", MountPath: "/mnt/data"}}}}},
+			}}}},
+			mounts:  []infra.StaticPVCMount{{ClaimName: "data", MountPath: "/mnt/data"}},
+			wantErr: "mount path",
+		},
+		{
+			name: "rejects existing PVC conflict",
+			sandbox: &v1alpha1.Sandbox{Spec: v1alpha1.SandboxSpec{EmbeddedSandboxTemplate: v1alpha1.EmbeddedSandboxTemplate{Template: &corev1.PodTemplateSpec{
+				Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "sandbox"}}, Volumes: []corev1.Volume{{Name: "existing", VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "data"}}}}},
+			}}}},
+			mounts:  []infra.StaticPVCMount{{ClaimName: "data", MountPath: "/mnt/data"}},
+			wantErr: "already referenced",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := injectStaticPVCMounts(tt.sandbox, tt.mounts)
+			if tt.wantErr != "" {
+				require.ErrorContains(t, err, tt.wantErr)
+				return
+			}
+			require.NoError(t, err)
+			template := tt.sandbox.Spec.Template
+			require.Len(t, template.Spec.Volumes, 1)
+			volume := template.Spec.Volumes[0]
+			assert.Equal(t, staticPVCVolumeName("data"), volume.Name)
+			assert.Equal(t, "data", volume.PersistentVolumeClaim.ClaimName)
+			mount := template.Spec.Containers[tt.wantTarget].VolumeMounts[0]
+			assert.Equal(t, "/mnt/data", mount.MountPath)
+			assert.Equal(t, tt.mounts[0].ReadOnly, mount.ReadOnly)
+			assert.NotEqual(t, v1alpha1.True, tt.sandbox.Annotations[v1alpha1.AnnotationCleanupEnabled])
+			if tt.name == "injects into named sandbox container and disables recycle" {
+				assert.Equal(t, "value", tt.sandbox.Annotations["example.com/preserved"])
+			}
+			assert.False(t, AsSandbox(tt.sandbox, nil).IsRecycleEnabled())
+		})
+	}
+}
+
+func TestPickAnAvailableSandbox_RequireFreshBypassesPool(t *testing.T) {
+	infraInstance, fc := NewTestInfra(t)
+	defer infraInstance.Stop(t.Context())
+
+	sbs := sandboxSetForTest("test-template", "default")
+	sbs.UID = types.UID("sandboxset-uid")
+	require.NoError(t, fc.Create(t.Context(), sbs))
+	pooled := &v1alpha1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "pooled-sandbox",
+			Namespace:         "default",
+			CreationTimestamp: metav1.Now(),
+			Labels:            map[string]string{v1alpha1.LabelSandboxPool: sbs.Name},
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: v1alpha1.GroupVersion.String(),
+				Kind:       "SandboxSet",
+				Name:       sbs.Name,
+				UID:        sbs.UID,
+				Controller: ptr.To(true),
+			}},
+		},
+		Status: v1alpha1.SandboxStatus{
+			Phase:   v1alpha1.SandboxRunning,
+			PodInfo: v1alpha1.PodInfo{PodIP: "10.0.0.2"},
+			Conditions: []metav1.Condition{{
+				Type:   string(v1alpha1.SandboxConditionReady),
+				Status: metav1.ConditionTrue,
+			}},
+		},
+	}
+	CreateSandboxWithStatus(t, fc, pooled)
+	require.Eventually(t, func() bool {
+		items, err := infraInstance.Cache.ListSandboxesInPool(t.Context(), infracache.ListSandboxesInPoolOptions{Namespace: "default", Pool: sbs.Name})
+		return err == nil && len(items) == 1
+	}, time.Second, 10*time.Millisecond)
+	require.Eventually(t, func() bool {
+		_, err := infraInstance.Cache.PickSandboxSet(t.Context(), infracache.PickSandboxSetOptions{Namespace: "default", Name: sbs.Name})
+		return err == nil
+	}, time.Second, 10*time.Millisecond)
+
+	opts, err := ValidateAndInitClaimOptions(infra.ClaimSandboxOptions{
+		Namespace:       "default",
+		Template:        sbs.Name,
+		User:            "test-user",
+		CreateOnNoStock: true,
+		RequireFresh:    true,
+		StaticPVCMounts: []infra.StaticPVCMount{{ClaimName: "data", MountPath: "/mnt/data"}},
+	})
+	require.NoError(t, err)
+	picked, lockType, err := pickAnAvailableSandbox(t.Context(), opts, &sync.Map{}, infraInstance.Cache)
+	require.NoError(t, err)
+	assert.Equal(t, infra.LockTypeCreate, lockType)
+	assert.Empty(t, picked.Name)
+	assert.NotEqual(t, pooled.Name, picked.Name)
+}
+
+func TestValidateAndInitClaimOptions_StaticPVCMounts(t *testing.T) {
+	tests := []struct {
+		name    string
+		opts    infra.ClaimSandboxOptions
+		wantErr string
+	}{
+		{
+			name:    "fresh requires create on no stock",
+			opts:    infra.ClaimSandboxOptions{Template: "template", User: "user", RequireFresh: true},
+			wantErr: "requires createOnNoStock",
+		},
+		{
+			name:    "mounts require fresh",
+			opts:    infra.ClaimSandboxOptions{Template: "template", User: "user", CreateOnNoStock: true, StaticPVCMounts: []infra.StaticPVCMount{{ClaimName: "data", MountPath: "/mnt/data"}}},
+			wantErr: "require a fresh sandbox",
+		},
+		{
+			name:    "backend revalidates mounts",
+			opts:    infra.ClaimSandboxOptions{Template: "template", User: "user", CreateOnNoStock: true, RequireFresh: true, StaticPVCMounts: []infra.StaticPVCMount{{ClaimName: "INVALID", MountPath: "/mnt/data"}}},
+			wantErr: "invalid claimName",
+		},
+		{
+			name: "valid",
+			opts: infra.ClaimSandboxOptions{Template: "template", User: "user", CreateOnNoStock: true, RequireFresh: true, StaticPVCMounts: []infra.StaticPVCMount{{ClaimName: "data", MountPath: "/mnt/data"}}},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := ValidateAndInitClaimOptions(tt.opts)
+			if tt.wantErr != "" {
+				require.ErrorContains(t, err, tt.wantErr)
+			} else {
+				require.NoError(t, err)
+			}
 		})
 	}
 }

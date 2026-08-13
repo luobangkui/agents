@@ -469,6 +469,53 @@ func TestParseExtensions(t *testing.T) {
 	}
 }
 
+func TestParseExtensionStaticPVCMounts(t *testing.T) {
+	tests := []struct {
+		name        string
+		raw         string
+		createStock string
+		wantErr     string
+		want        []StaticPVCMount
+	}{
+		{
+			name: "valid mounts",
+			raw:  `[{"claimName":"wenyon-data","mountPath":"/mnt/data","subPath":"jobs/current","readOnly":true}]`,
+			want: []StaticPVCMount{{ClaimName: "wenyon-data", MountPath: "/mnt/data", SubPath: "jobs/current", ReadOnly: true}},
+		},
+		{name: "requires cold creation", raw: `[{"claimName":"data","mountPath":"/mnt/data"}]`, createStock: v1alpha1.False, wantErr: "requires"},
+		{name: "unknown field", raw: `[{"claimName":"data","mountPath":"/mnt/data","extra":true}]`, wantErr: "unknown field"},
+		{name: "null is not an array", raw: `null`, wantErr: "JSON array"},
+		{name: "trailing JSON", raw: `[{"claimName":"data","mountPath":"/mnt/data"}] {}`, wantErr: "trailing"},
+		{name: "invalid claim", raw: `[{"claimName":"INVALID","mountPath":"/mnt/data"}]`, wantErr: "invalid claimName"},
+		{name: "relative mount path", raw: `[{"claimName":"data","mountPath":"mnt/data"}]`, wantErr: "clean absolute"},
+		{name: "root mount path", raw: `[{"claimName":"data","mountPath":"/"}]`, wantErr: "other than /"},
+		{name: "unclean mount path", raw: `[{"claimName":"data","mountPath":"/mnt/../data"}]`, wantErr: "clean absolute"},
+		{name: "absolute subpath", raw: `[{"claimName":"data","mountPath":"/mnt/data","subPath":"/jobs"}]`, wantErr: "clean relative"},
+		{name: "escaping subpath", raw: `[{"claimName":"data","mountPath":"/mnt/data","subPath":"../jobs"}]`, wantErr: "parent traversal"},
+		{name: "duplicate claim", raw: `[{"claimName":"data","mountPath":"/mnt/a"},{"claimName":"data","mountPath":"/mnt/b"}]`, wantErr: "duplicates claimName"},
+		{name: "duplicate mount path", raw: `[{"claimName":"data-a","mountPath":"/mnt/data"},{"claimName":"data-b","mountPath":"/mnt/data"}]`, wantErr: "duplicates mountPath"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			metadata := map[string]string{ExtensionKeyStaticPVCMounts: tt.raw, "user.example/key": "kept"}
+			if tt.createStock != "" {
+				metadata[ExtensionKeyCreateOnNoStock] = tt.createStock
+			}
+			req := NewSandboxRequest{Metadata: metadata}
+			err := req.ParseExtensions()
+			if tt.wantErr != "" {
+				require.ErrorContains(t, err, tt.wantErr)
+			} else {
+				require.NoError(t, err)
+				assert.Equal(t, tt.want, req.Extensions.StaticPVCMounts)
+			}
+			assert.NotContains(t, req.Metadata, ExtensionKeyStaticPVCMounts)
+			assert.Equal(t, "kept", req.Metadata["user.example/key"])
+		})
+	}
+}
+
 func TestParseAndRemoveQuantity(t *testing.T) {
 	tests := []struct {
 		name        string

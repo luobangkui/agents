@@ -127,6 +127,12 @@ func (sc *Controller) CreateSandbox(r *http.Request) (web.ApiResponse[*models.Sa
 		Namespace:    namespace,
 		CheckpointID: request.TemplateID,
 	}) {
+		if len(request.Extensions.StaticPVCMounts) > 0 {
+			return web.ApiResponse[*models.Sandbox]{}, &web.ApiError{
+				Code:    http.StatusBadRequest,
+				Message: "static PVC mounts are only supported when creating from a SandboxSet",
+			}
+		}
 		log.Info("infra has checkpoint, will create sandbox with clone", "templateID", request.TemplateID)
 		return sc.createSandboxWithClone(ctx, request, user, domain)
 	}
@@ -165,6 +171,18 @@ func (sc *Controller) createSandboxWithClaim(ctx context.Context, request models
 		ReserveFailedSandboxFor: request.Extensions.ReserveFailedSandboxFor,
 		CreateOnNoStock:         request.Extensions.CreateOnNoStock,
 		UserMetadataKeys:        sandboxcr.BuildUserMetadataKeys(request.Extensions.Labels, request.Metadata),
+	}
+	if len(request.Extensions.StaticPVCMounts) > 0 {
+		infraOpts.RequireFresh = true
+		infraOpts.StaticPVCMounts = make([]infra.StaticPVCMount, 0, len(request.Extensions.StaticPVCMounts))
+		for _, mount := range request.Extensions.StaticPVCMounts {
+			infraOpts.StaticPVCMounts = append(infraOpts.StaticPVCMounts, infra.StaticPVCMount{
+				ClaimName: mount.ClaimName,
+				MountPath: mount.MountPath,
+				SubPath:   mount.SubPath,
+				ReadOnly:  mount.ReadOnly,
+			})
+		}
 	}
 
 	if !request.Extensions.SkipInitRuntime {

@@ -19,7 +19,9 @@ package models
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
+	"path"
 	"strconv"
 	"strings"
 	"time"
@@ -68,6 +70,7 @@ const (
 	MetadataKeySandboxResource                = v1alpha1.E2BPrefix + "sandbox-resource"
 	ExtensionKeySandboxName                   = v1alpha1.E2BPrefix + "sandbox-name"
 	ExtensionKeySandboxGenerateName           = v1alpha1.E2BPrefix + "sandbox-generate-name"
+	ExtensionKeyStaticPVCMounts               = v1alpha1.E2BPrefix + "static-pvc-mounts"
 )
 
 const (
@@ -101,6 +104,74 @@ func (r *NewSandboxRequest) ParseExtensions() error {
 	}
 	// parse csi mount config
 	if err := r.parseExtensionCSIMount(); err != nil {
+		return err
+	}
+	if err := r.parseExtensionStaticPVCMounts(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (r *NewSandboxRequest) parseExtensionStaticPVCMounts() error {
+	raw, ok := r.Metadata[ExtensionKeyStaticPVCMounts]
+	if !ok {
+		return nil
+	}
+	defer delete(r.Metadata, ExtensionKeyStaticPVCMounts)
+
+	decoder := json.NewDecoder(strings.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	var mounts []StaticPVCMount
+	if err := decoder.Decode(&mounts); err != nil {
+		return fmt.Errorf("invalid static PVC mounts: %w", err)
+	}
+	if err := ensureJSONEOF(decoder); err != nil {
+		return fmt.Errorf("invalid static PVC mounts: %w", err)
+	}
+	if mounts == nil {
+		return fmt.Errorf("invalid static PVC mounts: value must be a JSON array")
+	}
+	if len(mounts) == 0 {
+		return nil
+	}
+	if !r.Extensions.CreateOnNoStock {
+		return fmt.Errorf("%s requires %s to be true", ExtensionKeyStaticPVCMounts, ExtensionKeyCreateOnNoStock)
+	}
+
+	claimNames := make(map[string]struct{}, len(mounts))
+	mountPaths := make(map[string]struct{}, len(mounts))
+	for i, mount := range mounts {
+		if errs := validation.IsDNS1123Subdomain(mount.ClaimName); len(errs) > 0 {
+			return fmt.Errorf("static PVC mount %d has invalid claimName %q: %s", i, mount.ClaimName, strings.Join(errs, ", "))
+		}
+		if !path.IsAbs(mount.MountPath) || mount.MountPath == "/" || path.Clean(mount.MountPath) != mount.MountPath {
+			return fmt.Errorf("static PVC mount %d mountPath %q must be a clean absolute path other than /", i, mount.MountPath)
+		}
+		if mount.SubPath != "" {
+			cleaned := path.Clean(mount.SubPath)
+			if path.IsAbs(mount.SubPath) || cleaned != mount.SubPath || cleaned == "." || cleaned == ".." || strings.HasPrefix(cleaned, "../") {
+				return fmt.Errorf("static PVC mount %d subPath %q must be a clean relative path without parent traversal", i, mount.SubPath)
+			}
+		}
+		if _, exists := claimNames[mount.ClaimName]; exists {
+			return fmt.Errorf("static PVC mount %d duplicates claimName %q", i, mount.ClaimName)
+		}
+		if _, exists := mountPaths[mount.MountPath]; exists {
+			return fmt.Errorf("static PVC mount %d duplicates mountPath %q", i, mount.MountPath)
+		}
+		claimNames[mount.ClaimName] = struct{}{}
+		mountPaths[mount.MountPath] = struct{}{}
+	}
+	r.Extensions.StaticPVCMounts = mounts
+	return nil
+}
+
+func ensureJSONEOF(decoder *json.Decoder) error {
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			return fmt.Errorf("unexpected trailing JSON value")
+		}
 		return err
 	}
 	return nil

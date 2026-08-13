@@ -96,6 +96,16 @@ type NewSandboxRequestExtension struct {
 	Labels                       map[string]string
 	Name                         string
 	GenerateName                 string
+	StaticPVCMounts              []StaticPVCMount
+}
+
+// StaticPVCMount describes a request-scoped existing PVC mount. It is parsed
+// from E2B metadata and never propagated as a Sandbox annotation.
+type StaticPVCMount struct {
+	ClaimName string `json:"claimName"`
+	MountPath string `json:"mountPath"`
+	SubPath   string `json:"subPath,omitempty"`
+	ReadOnly  bool   `json:"readOnly,omitempty"`
 }
 
 type InplaceUpdateExtension struct {

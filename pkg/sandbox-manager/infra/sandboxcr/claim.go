@@ -18,10 +18,12 @@ package sandboxcr
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"math/rand/v2"
+	"path"
 	"strings"
 	"sync"
 	"time"
@@ -33,6 +35,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/api/validate/content"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/klog/v2"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -43,6 +46,7 @@ import (
 	"github.com/openkruise/agents/pkg/controller/sandboxset"
 	"github.com/openkruise/agents/pkg/identity"
 	"github.com/openkruise/agents/pkg/sandbox-manager/consts"
+	managererrors "github.com/openkruise/agents/pkg/sandbox-manager/errors"
 	"github.com/openkruise/agents/pkg/sandbox-manager/infra"
 	"github.com/openkruise/agents/pkg/sandbox-manager/logs"
 	"github.com/openkruise/agents/pkg/servers/e2b/models"
@@ -72,6 +76,15 @@ func ValidateAndInitClaimOptions(opts infra.ClaimSandboxOptions) (infra.ClaimSan
 	}
 	if opts.Template == "" {
 		return infra.ClaimSandboxOptions{}, fmt.Errorf("template is required")
+	}
+	if opts.RequireFresh && !opts.CreateOnNoStock {
+		return infra.ClaimSandboxOptions{}, fmt.Errorf("require fresh sandbox requires createOnNoStock")
+	}
+	if len(opts.StaticPVCMounts) > 0 && !opts.RequireFresh {
+		return infra.ClaimSandboxOptions{}, fmt.Errorf("static PVC mounts require a fresh sandbox")
+	}
+	if err := validateStaticPVCMounts(opts.StaticPVCMounts); err != nil {
+		return infra.ClaimSandboxOptions{}, err
 	}
 	if opts.CSIMount != nil {
 		// for csi mount, init runtime is required
@@ -111,6 +124,37 @@ func ValidateAndInitClaimOptions(opts infra.ClaimSandboxOptions) (infra.ClaimSan
 		opts.ReserveFailedSandboxFor = ptr.To(DefaultReserveFailedSandboxFor)
 	}
 	return opts, nil
+}
+
+func validateStaticPVCMounts(mounts []infra.StaticPVCMount) error {
+	// This intentionally mirrors the E2B protocol validation as defense in
+	// depth: Infra is also called by non-E2B claim paths and must protect the
+	// Kubernetes mutation boundary from malformed options.
+	claimNames := make(map[string]struct{}, len(mounts))
+	mountPaths := make(map[string]struct{}, len(mounts))
+	for i, mount := range mounts {
+		if errs := validation.IsDNS1123Subdomain(mount.ClaimName); len(errs) > 0 {
+			return fmt.Errorf("static PVC mount %d has invalid claimName %q: %s", i, mount.ClaimName, strings.Join(errs, ", "))
+		}
+		if !path.IsAbs(mount.MountPath) || mount.MountPath == "/" || path.Clean(mount.MountPath) != mount.MountPath {
+			return fmt.Errorf("static PVC mount %d mountPath %q must be a clean absolute path other than /", i, mount.MountPath)
+		}
+		if mount.SubPath != "" {
+			cleaned := path.Clean(mount.SubPath)
+			if path.IsAbs(mount.SubPath) || cleaned != mount.SubPath || cleaned == "." || cleaned == ".." || strings.HasPrefix(cleaned, "../") {
+				return fmt.Errorf("static PVC mount %d subPath %q must be a clean relative path without parent traversal", i, mount.SubPath)
+			}
+		}
+		if _, exists := claimNames[mount.ClaimName]; exists {
+			return fmt.Errorf("static PVC mount %d duplicates claimName %q", i, mount.ClaimName)
+		}
+		if _, exists := mountPaths[mount.MountPath]; exists {
+			return fmt.Errorf("static PVC mount %d duplicates mountPath %q", i, mount.MountPath)
+		}
+		claimNames[mount.ClaimName] = struct{}{}
+		mountPaths[mount.MountPath] = struct{}{}
+	}
+	return nil
 }
 
 // chooseLockString returns the lock string to use for the current attempt.
@@ -527,6 +571,10 @@ func pickAnAvailableSandbox(ctx context.Context, opts infra.ClaimSandboxOptions,
 	template, cnt := opts.Template, opts.CandidateCounts
 	ctx = logs.Extend(ctx, "action", "pickAnAvailableSandbox")
 	log := klog.FromContext(ctx).WithValues("template", template).V(utils.DebugLogLevel)
+	if opts.RequireFresh {
+		log.Info("will create a fresh sandbox", "reason", "RequestRequiresFresh")
+		return newSandboxFromSandboxSet(ctx, opts, cache)
+	}
 	objects, err := cache.ListSandboxesInPool(ctx, infracache.ListSandboxesInPoolOptions{Namespace: opts.Namespace, Pool: template})
 	if err != nil {
 		return nil, "", err
@@ -693,12 +741,91 @@ func newSandboxFromSandboxSet(ctx context.Context, opts infra.ClaimSandboxOption
 		}
 	}
 	sbx := sandboxset.NewSandboxFromSandboxSet(sbs, refTemplate)
+	if len(opts.StaticPVCMounts) > 0 {
+		if refTemplate != nil {
+			if refTemplate.Spec.Template == nil {
+				return nil, "", managererrors.NewError(managererrors.ErrorBadRequest, "cannot inject static PVC mounts: referenced sandbox template has no pod template")
+			}
+			sbx.Spec.Template = refTemplate.Spec.Template.DeepCopy()
+			sbx.Spec.TemplateRef = nil
+		}
+		if err := injectStaticPVCMounts(sbx, opts.StaticPVCMounts); err != nil {
+			return nil, "", managererrors.NewError(managererrors.ErrorBadRequest, "cannot inject static PVC mounts: %s", err)
+		}
+	}
 	// sandbox manager creates high-priority sandbox
 	sbx.Annotations[v1alpha1.SandboxAnnotationPriority] = "100"
 	for _, anno := range FilteredAnnotationsOnCreation {
 		delete(sbx.Annotations, anno)
 	}
 	return AsSandbox(sbx, cache), infra.LockTypeCreate, nil
+}
+
+func injectStaticPVCMounts(sbx *v1alpha1.Sandbox, mounts []infra.StaticPVCMount) error {
+	if sbx.Spec.Template == nil {
+		return errors.New("sandbox pod template is missing")
+	}
+	if len(sbx.Spec.Template.Spec.Containers) == 0 {
+		return errors.New("sandbox pod template has no containers")
+	}
+
+	containerIndex := 0
+	for i := range sbx.Spec.Template.Spec.Containers {
+		if sbx.Spec.Template.Spec.Containers[i].Name == "sandbox" {
+			containerIndex = i
+			break
+		}
+	}
+	container := &sbx.Spec.Template.Spec.Containers[containerIndex]
+	existingVolumeNames := make(map[string]struct{}, len(sbx.Spec.Template.Spec.Volumes))
+	existingClaimNames := make(map[string]struct{}, len(sbx.Spec.Template.Spec.Volumes))
+	for _, volume := range sbx.Spec.Template.Spec.Volumes {
+		existingVolumeNames[volume.Name] = struct{}{}
+		if volume.PersistentVolumeClaim != nil {
+			existingClaimNames[volume.PersistentVolumeClaim.ClaimName] = struct{}{}
+		}
+	}
+	existingMountPaths := make(map[string]struct{}, len(container.VolumeMounts))
+	for _, mount := range container.VolumeMounts {
+		existingMountPaths[mount.MountPath] = struct{}{}
+	}
+
+	for _, mount := range mounts {
+		volumeName := staticPVCVolumeName(mount.ClaimName)
+		if _, exists := existingVolumeNames[volumeName]; exists {
+			return fmt.Errorf("volume name %q conflicts with the sandbox template", volumeName)
+		}
+		if _, exists := existingClaimNames[mount.ClaimName]; exists {
+			return fmt.Errorf("PVC %q is already referenced by the sandbox template", mount.ClaimName)
+		}
+		if _, exists := existingMountPaths[mount.MountPath]; exists {
+			return fmt.Errorf("mount path %q conflicts with the sandbox container", mount.MountPath)
+		}
+
+		sbx.Spec.Template.Spec.Volumes = append(sbx.Spec.Template.Spec.Volumes, corev1.Volume{
+			Name: volumeName,
+			VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+				ClaimName: mount.ClaimName,
+				ReadOnly:  mount.ReadOnly,
+			}},
+		})
+		container.VolumeMounts = append(container.VolumeMounts, corev1.VolumeMount{
+			Name:      volumeName,
+			MountPath: mount.MountPath,
+			SubPath:   mount.SubPath,
+			ReadOnly:  mount.ReadOnly,
+		})
+		existingVolumeNames[volumeName] = struct{}{}
+		existingClaimNames[mount.ClaimName] = struct{}{}
+		existingMountPaths[mount.MountPath] = struct{}{}
+	}
+	delete(sbx.Annotations, v1alpha1.AnnotationCleanupEnabled)
+	return nil
+}
+
+func staticPVCVolumeName(claimName string) string {
+	digest := sha256.Sum256([]byte(claimName))
+	return fmt.Sprintf("static-pvc-%x", digest[:8])
 }
 
 func preCheckCandidate(sbx *v1alpha1.Sandbox) error {
