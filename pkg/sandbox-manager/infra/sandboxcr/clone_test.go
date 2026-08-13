@@ -25,6 +25,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/time/rate"
@@ -277,10 +278,11 @@ func TestNewSandboxFromTemplate_DeepCopiesTemplate(t *testing.T) {
 				},
 			}
 
-			sbx := newSandboxFromTemplate(infra.CloneSandboxOptions{
+			sbx, err := newSandboxFromTemplate(infra.CloneSandboxOptions{
 				User:         "test-user",
 				CheckPointID: "checkpoint-template",
 			}, tmpl, nil)
+			require.NoError(t, err)
 			tt.mutate(sbx)
 			tt.verifyInitial(t, tmpl)
 		})
@@ -343,7 +345,8 @@ func TestNewSandboxFromTemplate_Naming(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			sbx := newSandboxFromTemplate(tt.opts, tmpl, nil)
+			sbx, err := newSandboxFromTemplate(tt.opts, tmpl, nil)
+			require.NoError(t, err)
 			assert.Equal(t, tt.expectName, sbx.GetName())
 			assert.Equal(t, tt.expectGenerateName, sbx.GetGenerateName())
 		})
@@ -370,10 +373,11 @@ func TestNewSandboxFromTemplate_StampsCloneLockString(t *testing.T) {
 		},
 	}
 
-	sbx := newSandboxFromTemplate(infra.CloneSandboxOptions{
+	sbx, err := newSandboxFromTemplate(infra.CloneSandboxOptions{
 		User:       "user-1",
 		LockString: "lock-1",
 	}, tmpl, nil)
+	require.NoError(t, err)
 
 	require.NotNil(t, sbx.Annotations)
 	assert.Equal(t, "user-1", sbx.Annotations[v1alpha1.AnnotationOwner])
@@ -458,6 +462,64 @@ func TestPrepareSandboxFromCheckpoint_CSIMountConfigPrecedence(t *testing.T) {
 	}
 }
 
+func TestPrepareSandboxFromCheckpoint_JWTAuthMerge(t *testing.T) {
+	tmpl := &v1alpha1.SandboxTemplate{
+		ObjectMeta: metav1.ObjectMeta{Name: "cp-jwt", Namespace: "default"},
+		Spec: v1alpha1.SandboxTemplateSpec{
+			Template: &corev1.PodTemplateSpec{
+				Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "main", Image: "test-image"}}},
+			},
+		},
+	}
+
+	tests := []struct {
+		name              string
+		checkpointSetting *string
+		requestSetting    *string
+		expectSetting     *string
+	}{
+		{name: "both unset"},
+		{name: "request explicitly disables", requestSetting: ptr.To(v1alpha1.False), expectSetting: ptr.To(v1alpha1.False)},
+		{name: "request enables", requestSetting: ptr.To(v1alpha1.True), expectSetting: ptr.To(v1alpha1.True)},
+		{name: "checkpoint disables", checkpointSetting: ptr.To(v1alpha1.False), expectSetting: ptr.To(v1alpha1.False)},
+		{name: "request strengthens disabled checkpoint", checkpointSetting: ptr.To(v1alpha1.False), requestSetting: ptr.To(v1alpha1.True), expectSetting: ptr.To(v1alpha1.True)},
+		{name: "inherits enabled checkpoint", checkpointSetting: ptr.To(v1alpha1.True), expectSetting: ptr.To(v1alpha1.True)},
+		{name: "request keeps enabled checkpoint", checkpointSetting: ptr.To(v1alpha1.True), requestSetting: ptr.To(v1alpha1.True), expectSetting: ptr.To(v1alpha1.True)},
+		{name: "request disables enabled checkpoint", checkpointSetting: ptr.To(v1alpha1.True), requestSetting: ptr.To(v1alpha1.False), expectSetting: ptr.To(v1alpha1.False)},
+		{name: "non-standard request value is preserved", requestSetting: ptr.To("True"), expectSetting: ptr.To("True")},
+		{name: "non-standard checkpoint value is inherited", checkpointSetting: ptr.To("1"), expectSetting: ptr.To("1")},
+		{name: "non-standard request overrides enabled checkpoint", checkpointSetting: ptr.To(v1alpha1.True), requestSetting: ptr.To("True"), expectSetting: ptr.To("True")},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cp := &v1alpha1.Checkpoint{ObjectMeta: metav1.ObjectMeta{Name: "cp-jwt", Namespace: "default"}}
+			if tt.checkpointSetting != nil {
+				cp.Annotations = map[string]string{identity.AnnotationEnableJwtAuth: *tt.checkpointSetting}
+			}
+			opts := infra.CloneSandboxOptions{User: "test-user", CheckPointID: "cp-jwt"}
+			if tt.requestSetting != nil {
+				opts.Modifier = func(sbx infra.Sandbox) error {
+					annotations := sbx.GetAnnotations()
+					annotations[identity.AnnotationEnableJwtAuth] = *tt.requestSetting
+					sbx.SetAnnotations(annotations)
+					return nil
+				}
+			}
+
+			sbx, _, err := prepareSandboxFromCheckpoint(t.Context(), opts, tmpl, cp, nil)
+			require.NoError(t, err)
+			value, present := sbx.GetAnnotations()[identity.AnnotationEnableJwtAuth]
+			if tt.expectSetting == nil {
+				assert.False(t, present)
+				return
+			}
+			assert.True(t, present)
+			assert.Equal(t, *tt.expectSetting, value)
+		})
+	}
+}
+
 func TestFindCheckpointAndTemplateById_NamespaceScoped(t *testing.T) {
 	objects := []client.Object{
 		&v1alpha1.SandboxTemplate{
@@ -521,32 +583,35 @@ func createCloneTestCheckpoint(t *testing.T, c client.Client, cache infracache.P
 	}, time.Second, 10*time.Millisecond)
 }
 
-type cloneAdmissionQuotaTracker struct {
+// admissionQuotaTracker is the shared claim/clone admission recorder: it
+// enforces a capacity limit and keeps ordered acquire/release events.
+type admissionQuotaTracker struct {
 	t        *testing.T
 	limit    int
 	mu       sync.Mutex
 	held     map[string]struct{}
 	acquires []string
 	releases []string
+	events   []string
 }
 
-func newCloneAdmissionQuotaTracker(t *testing.T, limit int) *cloneAdmissionQuotaTracker {
+func newAdmissionQuotaTracker(t *testing.T, limit int) *admissionQuotaTracker {
 	t.Helper()
-	return &cloneAdmissionQuotaTracker{
+	return &admissionQuotaTracker{
 		t:     t,
 		limit: limit,
 		held:  map[string]struct{}{},
 	}
 }
 
-func (q *cloneAdmissionQuotaTracker) admission() *infra.SandboxAdmission {
+func (q *admissionQuotaTracker) admission() *infra.SandboxAdmission {
 	return &infra.SandboxAdmission{
 		Acquire: q.acquire,
 		Release: q.release,
 	}
 }
 
-func (q *cloneAdmissionQuotaTracker) acquire(ctx context.Context, lockString string, _ infra.SandboxResource) error {
+func (q *admissionQuotaTracker) acquire(ctx context.Context, lockString string, _ infra.SandboxResource) error {
 	q.t.Helper()
 
 	q.mu.Lock()
@@ -554,6 +619,7 @@ func (q *cloneAdmissionQuotaTracker) acquire(ctx context.Context, lockString str
 
 	require.NotEmpty(q.t, lockString)
 	q.acquires = append(q.acquires, lockString)
+	q.events = append(q.events, "acquire:"+lockString)
 	if _, exists := q.held[lockString]; exists {
 		q.t.Fatalf("duplicate admission acquire for %q", lockString)
 	}
@@ -564,7 +630,7 @@ func (q *cloneAdmissionQuotaTracker) acquire(ctx context.Context, lockString str
 	return nil
 }
 
-func (q *cloneAdmissionQuotaTracker) release(ctx context.Context, lockString string) error {
+func (q *admissionQuotaTracker) release(ctx context.Context, lockString string) error {
 	q.t.Helper()
 
 	assertShortQuotaReleaseDeadline(q.t, ctx)
@@ -573,6 +639,7 @@ func (q *cloneAdmissionQuotaTracker) release(ctx context.Context, lockString str
 	defer q.mu.Unlock()
 
 	q.releases = append(q.releases, lockString)
+	q.events = append(q.events, "release:"+lockString)
 	if _, exists := q.held[lockString]; !exists {
 		q.t.Fatalf("release called for unheld lockString %q", lockString)
 	}
@@ -580,19 +647,25 @@ func (q *cloneAdmissionQuotaTracker) release(ctx context.Context, lockString str
 	return nil
 }
 
-func (q *cloneAdmissionQuotaTracker) acquireCalls() []string {
+func (q *admissionQuotaTracker) acquireCalls() []string {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	return append([]string(nil), q.acquires...)
 }
 
-func (q *cloneAdmissionQuotaTracker) releaseCalls() []string {
+func (q *admissionQuotaTracker) releaseCalls() []string {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	return append([]string(nil), q.releases...)
 }
 
-func (q *cloneAdmissionQuotaTracker) heldLockStrings() []string {
+func (q *admissionQuotaTracker) eventsSnapshot() []string {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return append([]string(nil), q.events...)
+}
+
+func (q *admissionQuotaTracker) heldLockStrings() []string {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
@@ -603,44 +676,26 @@ func (q *cloneAdmissionQuotaTracker) heldLockStrings() []string {
 	return locks
 }
 
-func (q *cloneAdmissionQuotaTracker) liveCount() int {
+func (q *admissionQuotaTracker) liveCount() int {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	return len(q.held)
 }
 
-func setFastCloneRetryForTest(t *testing.T) {
-	t.Helper()
-
-	origCreateRetryInterval := CreateRetryInterval
-	origCreateRetryBackoffFactor := CreateRetryBackoffFactor
-	origCreateRetryJitter := CreateRetryJitter
-	origCreateRetryIntervalCap := CreateRetryIntervalCap
-	CreateRetryInterval = 10 * time.Millisecond
-	CreateRetryBackoffFactor = 1
-	CreateRetryJitter = 0
-	CreateRetryIntervalCap = 10 * time.Millisecond
-	t.Cleanup(func() {
-		CreateRetryInterval = origCreateRetryInterval
-		CreateRetryBackoffFactor = origCreateRetryBackoffFactor
-		CreateRetryJitter = origCreateRetryJitter
-		CreateRetryIntervalCap = origCreateRetryIntervalCap
-	})
-}
-
 func TestCloneSandbox_AdmissionReceivesPreparedResource(t *testing.T) {
 	tests := []struct {
 		name       string
-		modifier   func(infra.Sandbox)
+		modifier   func(infra.Sandbox) error
 		wantReqCPU int64
 		wantLimCPU int64
 	}{
 		{
 			name: "clone admission sees modifier-updated cpu limit",
-			modifier: func(sbx infra.Sandbox) {
+			modifier: func(sbx infra.Sandbox) error {
 				sbx.(*Sandbox).SetResources(nil, corev1.ResourceList{
 					corev1.ResourceCPU: resource.MustParse("2"),
 				})
+				return nil
 			},
 			wantReqCPU: 500,
 			wantLimCPU: 2000,
@@ -650,9 +705,8 @@ func TestCloneSandbox_AdmissionReceivesPreparedResource(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			testInfra, fc := NewTestInfra(t, config.SandboxManagerOptions{
-				MaxClaimWorkers:            1,
-				MaxCreateQPS:               1000,
-				DisableRouteReconciliation: true,
+				MaxClaimWorkers: 1,
+				MaxCreateQPS:    1000,
 			})
 			checkpointID := "clone-admission-resource"
 			sbt := &v1alpha1.SandboxTemplate{
@@ -724,9 +778,8 @@ func TestCloneSandbox_AdmissionReceivesPreparedResource(t *testing.T) {
 
 func TestCloneSandbox_AdmissionQuotaExceededIsTerminalBeforeCreate(t *testing.T) {
 	testInfra, fc := NewTestInfra(t, config.SandboxManagerOptions{
-		MaxClaimWorkers:            1,
-		MaxCreateQPS:               1000,
-		DisableRouteReconciliation: true,
+		MaxClaimWorkers: 1,
+		MaxCreateQPS:    1000,
 	})
 	checkpointID := "clone-admission-terminal"
 	createCloneTestCheckpoint(t, fc, testInfra.Cache, checkpointID)
@@ -742,7 +795,7 @@ func TestCloneSandbox_AdmissionQuotaExceededIsTerminalBeforeCreate(t *testing.T)
 		return nil, nil
 	}
 
-	quota := newCloneAdmissionQuotaTracker(t, 0)
+	quota := newAdmissionQuotaTracker(t, 0)
 	opts, err := ValidateAndInitCloneOptions(infra.CloneSandboxOptions{
 		User:                    "test-user",
 		CheckPointID:            checkpointID,
@@ -764,13 +817,54 @@ func TestCloneSandbox_AdmissionQuotaExceededIsTerminalBeforeCreate(t *testing.T)
 	assert.True(t, limiter.Allow(), "quota rejection must not consume create limiter capacity")
 }
 
+func TestInfraCloneSandbox_ModifierErrorStopsBeforeCreate(t *testing.T) {
+	const expectError = "modifier rejected clone"
+	testInfra, fc := NewTestInfra(t, config.SandboxManagerOptions{})
+	const checkpointID = "modifier-error-clone"
+	createCloneTestCheckpoint(t, fc, testInfra.Cache, checkpointID)
+
+	origCreateSandbox := DefaultCreateSandbox
+	createCalls := 0
+	DefaultCreateSandbox = func(context.Context, *v1alpha1.Sandbox, client.Client) (*v1alpha1.Sandbox, error) {
+		createCalls++
+		return nil, errors.New("unexpected sandbox create")
+	}
+	t.Cleanup(func() { DefaultCreateSandbox = origCreateSandbox })
+
+	modifierErr := NoAvailableError(checkpointID, expectError)
+	modifierCalls := 0
+	admissionCalls := 0
+	cloned, metrics, err := testInfra.CloneSandbox(t.Context(), infra.CloneSandboxOptions{
+		User:         "test-user",
+		CheckPointID: checkpointID,
+		CloneTimeout: time.Second,
+		Modifier: func(infra.Sandbox) error {
+			modifierCalls++
+			return modifierErr
+		},
+		Admission: &infra.SandboxAdmission{
+			Acquire: func(context.Context, string, infra.SandboxResource) error {
+				admissionCalls++
+				return nil
+			},
+		},
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), expectError)
+	assert.ErrorIs(t, err, modifierErr)
+	assert.Nil(t, cloned)
+	assert.Equal(t, 1, modifierCalls)
+	assert.Zero(t, admissionCalls)
+	assert.Zero(t, createCalls)
+	assert.Zero(t, metrics.Retries)
+}
+
 func TestCloneSandbox_ReleasesQuotaAfterKilledFailedCloneAllowsRetryWithFreshLockString(t *testing.T) {
-	setFastCloneRetryForTest(t)
+	setFastCreateRetryForTest(t)
 
 	testInfra, fc := NewTestInfra(t, config.SandboxManagerOptions{
-		MaxClaimWorkers:            1,
-		MaxCreateQPS:               1000,
-		DisableRouteReconciliation: true,
+		MaxClaimWorkers: 1,
+		MaxCreateQPS:    1000,
 	})
 	checkpointID := "clone-quota-release-retry"
 	createCloneTestCheckpoint(t, fc, testInfra.Cache, checkpointID)
@@ -778,7 +872,7 @@ func TestCloneSandbox_ReleasesQuotaAfterKilledFailedCloneAllowsRetryWithFreshLoc
 	origCreateSandbox := DefaultCreateSandbox
 	t.Cleanup(func() { DefaultCreateSandbox = origCreateSandbox })
 
-	quota := newCloneAdmissionQuotaTracker(t, 1)
+	quota := newAdmissionQuotaTracker(t, 1)
 	var createdNames []string
 	createCalls := 0
 	DefaultCreateSandbox = func(ctx context.Context, sbx *v1alpha1.Sandbox, c client.Client) (*v1alpha1.Sandbox, error) {
@@ -841,12 +935,11 @@ func TestCloneSandbox_ReleasesQuotaAfterKilledFailedCloneAllowsRetryWithFreshLoc
 }
 
 func TestCloneSandbox_ForeverReserveRetainsQuotaOnWaitReadyFailure(t *testing.T) {
-	setFastCloneRetryForTest(t)
+	setFastCreateRetryForTest(t)
 
 	testInfra, fc := NewTestInfra(t, config.SandboxManagerOptions{
-		MaxClaimWorkers:            1,
-		MaxCreateQPS:               1000,
-		DisableRouteReconciliation: true,
+		MaxClaimWorkers: 1,
+		MaxCreateQPS:    1000,
 	})
 	checkpointID := "clone-quota-default-reserve"
 	createCloneTestCheckpoint(t, fc, testInfra.Cache, checkpointID)
@@ -854,7 +947,7 @@ func TestCloneSandbox_ForeverReserveRetainsQuotaOnWaitReadyFailure(t *testing.T)
 	origCreateSandbox := DefaultCreateSandbox
 	t.Cleanup(func() { DefaultCreateSandbox = origCreateSandbox })
 
-	quota := newCloneAdmissionQuotaTracker(t, 1)
+	quota := newAdmissionQuotaTracker(t, 1)
 	const firstSandboxName = "clone-quota-default-reserve-1"
 	createCalls := 0
 	DefaultCreateSandbox = func(ctx context.Context, sbx *v1alpha1.Sandbox, c client.Client) (*v1alpha1.Sandbox, error) {
@@ -892,12 +985,11 @@ func TestCloneSandbox_ForeverReserveRetainsQuotaOnWaitReadyFailure(t *testing.T)
 }
 
 func TestCloneSandbox_AmbiguousCreateFailureRetainsAdmissionAndStopsRetry(t *testing.T) {
-	setFastCloneRetryForTest(t)
+	setFastCreateRetryForTest(t)
 
 	testInfra, fc := NewTestInfra(t, config.SandboxManagerOptions{
-		MaxClaimWorkers:            1,
-		MaxCreateQPS:               1000,
-		DisableRouteReconciliation: true,
+		MaxClaimWorkers: 1,
+		MaxCreateQPS:    1000,
 	})
 	checkpointID := "clone-transient-create-failure"
 	createCloneTestCheckpoint(t, fc, testInfra.Cache, checkpointID)
@@ -905,7 +997,7 @@ func TestCloneSandbox_AmbiguousCreateFailureRetainsAdmissionAndStopsRetry(t *tes
 	origCreateSandbox := DefaultCreateSandbox
 	t.Cleanup(func() { DefaultCreateSandbox = origCreateSandbox })
 
-	quota := newCloneAdmissionQuotaTracker(t, 1)
+	quota := newAdmissionQuotaTracker(t, 1)
 	createCalls := 0
 	DefaultCreateSandbox = func(ctx context.Context, sbx *v1alpha1.Sandbox, c client.Client) (*v1alpha1.Sandbox, error) {
 		createCalls++
@@ -1165,10 +1257,11 @@ func TestCloneSandbox(t *testing.T) {
 				User:             user,
 				CheckPointID:     checkpointID,
 				WaitReadyTimeout: 30 * time.Second,
-				Modifier: func(sbx infra.Sandbox) {
+				Modifier: func(sbx infra.Sandbox) error {
 					sbx.SetAnnotations(map[string]string{
 						"custom-annotation": "custom-value",
 					})
+					return nil
 				},
 			},
 			serverOpts: testutils.TestRuntimeServerOptions{
@@ -1366,12 +1459,13 @@ func TestCloneSandbox(t *testing.T) {
 				CSIMount: &config.CSIMountOptions{
 					MountOptionList: []config.MountConfig{
 						{
-							Driver:     "test-driver",
-							RequestRaw: "test-request",
+							Driver:         "test-driver",
+							PublishRequest: &csi.NodePublishVolumeRequest{VolumeId: "test-volume", TargetPath: "/mnt/data"},
 						},
 					},
 				},
 			},
+			initRuntime: &config.InitRuntimeOptions{},
 			serverOpts: testutils.TestRuntimeServerOptions{
 				RunCommandResult: runtime.RunCommandResult{
 					PID:      1,
@@ -1383,6 +1477,7 @@ func TestCloneSandbox(t *testing.T) {
 			sbxOverride: sbxOverride{Name: "test-sandbox-csi-mount-1", AccessToken: runtime.AccessToken},
 			postCheck: func(t *testing.T, sbx infra.Sandbox, metrics infra.CloneMetrics) {
 				assert.NotNil(t, sbx)
+				assert.Greater(t, metrics.InitRuntime, time.Duration(0), "InitRuntime metric should be greater than 0")
 				assert.Greater(t, metrics.CSIMount, time.Duration(0), "CSIMount metric should be greater than 0")
 				assert.GreaterOrEqual(t, metrics.Total, metrics.CSIMount, "Total should include CSIMount time")
 			},
@@ -1396,8 +1491,8 @@ func TestCloneSandbox(t *testing.T) {
 				CSIMount: &config.CSIMountOptions{
 					MountOptionList: []config.MountConfig{
 						{
-							Driver:     "test-driver",
-							RequestRaw: "test-request",
+							Driver:         "test-driver",
+							PublishRequest: &csi.NodePublishVolumeRequest{VolumeId: "test-volume", TargetPath: "/mnt/data"},
 						},
 					},
 				},
@@ -1803,6 +1898,7 @@ func TestCreateCheckPoint(t *testing.T) {
 				require.NoError(t, c.Get(t.Context(), types.NamespacedName{Namespace: "default", Name: "tmpl-1"}, &cp))
 				assert.Equal(t, "tmpl-1", cp.Name)
 				assert.Equal(t, "test-sandbox-1", *cp.Spec.PodName)
+				assert.Equal(t, "default--test-sandbox-1", cp.Annotations[v1alpha1.AnnotationSandboxID])
 				assert.Empty(t, cp.OwnerReferences, "checkpoint should have no owner references")
 				assert.Equal(t, "cp-id-123", cp.Labels[v1alpha1.CheckpointLabelID])
 				var tmpl v1alpha1.SandboxTemplate
@@ -1814,6 +1910,28 @@ func TestCreateCheckPoint(t *testing.T) {
 				// Verify PersistentContents: sandbox has no PersistentContents, so both template and checkpoint should be empty
 				assert.Empty(t, tmpl.Spec.PersistentContents, "template PersistentContents should be empty when sandbox has no PersistentContents")
 				assert.Empty(t, cp.Spec.PersistentContents, "checkpoint PersistentContents should be empty when sandbox has no PersistentContents")
+			},
+		},
+		{
+			name: "checkpoint records the short label identity of the source",
+			sandbox: func() *v1alpha1.Sandbox {
+				sbx := newTestSandbox("test-sandbox-short-id")
+				sbx.Labels = map[string]string{v1alpha1.LabelSandboxID: "opaque-short-id"}
+				return sbx
+			}(),
+			cpStatus: v1alpha1.CheckpointStatus{
+				Phase:        v1alpha1.CheckpointSucceeded,
+				CheckpointId: "cp-id-short",
+			},
+			tmplOverride: tmplOverride{Name: "tmpl-short-id", UID: "uid-short-id"},
+			opts: infra.CreateCheckpointOptions{
+				WaitSuccessTimeout: 5 * time.Second,
+			},
+			postCheck: func(t *testing.T, id string, c client.Client) {
+				assert.Equal(t, "cp-id-short", id)
+				var cp v1alpha1.Checkpoint
+				require.NoError(t, c.Get(t.Context(), types.NamespacedName{Namespace: "default", Name: "tmpl-short-id"}, &cp))
+				assert.Equal(t, "opaque-short-id", cp.Annotations[v1alpha1.AnnotationSandboxID])
 			},
 		},
 		{
@@ -2176,9 +2294,8 @@ func TestCreateCheckPoint(t *testing.T) {
 
 func TestCloneSandboxAdmissionUsesPersistedLockString(t *testing.T) {
 	testInfra, fc := NewTestInfra(t, config.SandboxManagerOptions{
-		MaxClaimWorkers:            1,
-		MaxCreateQPS:               1000,
-		DisableRouteReconciliation: true,
+		MaxClaimWorkers: 1,
+		MaxCreateQPS:    1000,
 	})
 	checkpointID := "clone-lockstring-precondition"
 	createCloneTestCheckpoint(t, fc, testInfra.Cache, checkpointID)
@@ -2207,7 +2324,7 @@ func TestCloneSandboxAdmissionUsesPersistedLockString(t *testing.T) {
 	}
 
 	var acquired string
-	quota := newCloneAdmissionQuotaTracker(t, 1)
+	quota := newAdmissionQuotaTracker(t, 1)
 	origAcquire := quota.admission().Acquire
 	opts, err := ValidateAndInitCloneOptions(infra.CloneSandboxOptions{
 		User:         "user-1",
@@ -2440,6 +2557,143 @@ func TestCloneSandbox_SecurityToken(t *testing.T) {
 
 			if tt.postCheck != nil {
 				tt.postCheck(t, sbx, metrics)
+			}
+		})
+	}
+}
+
+func TestCloneSandbox_TrafficAccessToken(t *testing.T) {
+	const expiration = "2099-01-01T00:00:00Z"
+
+	tests := []struct {
+		name              string
+		checkpointSetting string
+		providerResponse  *identity.TokenResponse
+		providerError     error
+		expectError       string
+		expectToken       bool
+		expectInterrupted bool
+	}{
+		{
+			name:              "issues token for cloned sandbox identity",
+			checkpointSetting: v1alpha1.True,
+			providerResponse:  &identity.TokenResponse{AccessToken: "clone-traffic-token", AccessTokenExpiration: expiration},
+			expectToken:       true,
+		},
+		{
+			name:              "skips issuance when JWT auth is disabled",
+			checkpointSetting: v1alpha1.False,
+		},
+		{
+			name:              "provider error fails clone",
+			checkpointSetting: v1alpha1.True,
+			providerError:     errors.New("traffic token provider unavailable"),
+			expectError:       "traffic token provider unavailable",
+		},
+		{
+			name:              "context cancellation is preserved",
+			checkpointSetting: v1alpha1.True,
+			providerError:     context.Canceled,
+			expectError:       context.Canceled.Error(),
+			expectInterrupted: true,
+		},
+		{
+			name:              "empty token fails clone",
+			checkpointSetting: v1alpha1.True,
+			providerResponse:  &identity.TokenResponse{AccessTokenExpiration: expiration},
+			expectError:       "empty access token",
+		},
+		{
+			name:              "invalid expiration fails clone",
+			checkpointSetting: v1alpha1.True,
+			providerResponse:  &identity.TokenResponse{AccessToken: "clone-traffic-token", AccessTokenExpiration: "not-a-time"},
+			expectError:       "invalid access token expiration",
+		},
+	}
+
+	for i, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cache, fc, err := cachetest.NewTestCache(t)
+			require.NoError(t, err)
+			require.NoError(t, cache.Run(t.Context()))
+			defer cache.Stop(t.Context())
+
+			checkpointID := fmt.Sprintf("clone-traffic-token-%d", i)
+			createCloneTestCheckpoint(t, fc, cache, checkpointID)
+			cp := &v1alpha1.Checkpoint{}
+			require.NoError(t, fc.Get(t.Context(), types.NamespacedName{Namespace: "default", Name: checkpointID}, cp))
+			cp.Annotations = map[string]string{identity.AnnotationEnableJwtAuth: tt.checkpointSetting}
+			require.NoError(t, fc.Update(t.Context(), cp))
+
+			sandboxName := fmt.Sprintf("cloned-traffic-token-%d", i)
+			sandboxUID := types.UID(fmt.Sprintf("cloned-uid-%d", i))
+			providerCalled := false
+			identity.RegisterProvider(&mockIdentityProvider{
+				issueTokenWithKindFunc: func(_ context.Context, sbx *v1alpha1.Sandbox, kind identity.TokenKind) (*identity.TokenResponse, error) {
+					providerCalled = true
+					assert.Equal(t, identity.TokenKindAccessToken, kind)
+					assert.Equal(t, sandboxName, sbx.Name)
+					assert.Equal(t, sandboxUID, sbx.UID)
+					return tt.providerResponse, tt.providerError
+				},
+			})
+			t.Cleanup(func() { identity.RegisterProvider(identity.NewDefaultIdentityProvider()) })
+
+			origCreateSandbox := DefaultCreateSandbox
+			DefaultCreateSandbox = func(ctx context.Context, sbx *v1alpha1.Sandbox, c client.Client) (*v1alpha1.Sandbox, error) {
+				sbx.Name = sandboxName
+				sbx.UID = sandboxUID
+				created, createErr := origCreateSandbox(ctx, sbx, c)
+				if createErr != nil {
+					return nil, createErr
+				}
+				markSandboxReadyForTest(t, ctx, c, created, "1.2.3.4")
+				return created, nil
+			}
+			t.Cleanup(func() { DefaultCreateSandbox = origCreateSandbox })
+
+			sbx, metrics, cloneErr := CloneSandbox(t.Context(), infra.CloneSandboxOptions{
+				User:                    "test-user",
+				CheckPointID:            checkpointID,
+				WaitReadyTimeout:        time.Second,
+				ReserveFailedSandboxFor: ptr.To(consts.ReserveFailedSandboxNever),
+			}, cache)
+
+			if tt.expectError != "" {
+				require.Error(t, cloneErr)
+				assert.Contains(t, cloneErr.Error(), tt.expectError)
+				assert.Nil(t, sbx)
+				assert.True(t, providerCalled)
+				var retryErr retriableError
+				if tt.expectInterrupted {
+					assert.ErrorIs(t, cloneErr, context.Canceled)
+					assert.False(t, errors.As(cloneErr, &retryErr))
+				} else {
+					assert.True(t, errors.As(cloneErr, &retryErr))
+				}
+				stored := &v1alpha1.Sandbox{}
+				deleteErr := fc.Get(t.Context(), types.NamespacedName{Namespace: "default", Name: sandboxName}, stored)
+				assert.True(t, apierrors.IsNotFound(deleteErr), "failed clone must clean up the new sandbox")
+				return
+			}
+
+			require.NoError(t, cloneErr)
+			require.NotNil(t, sbx)
+			assert.Equal(t, tt.expectToken, providerCalled)
+			if tt.expectToken {
+				assert.Equal(t, "clone-traffic-token", sbx.GetTrafficAccessToken())
+				assert.Equal(t, expiration, sbx.GetTrafficAccessTokenExpiration())
+				assert.Greater(t, metrics.TrafficToken, time.Duration(0))
+			} else {
+				assert.Empty(t, sbx.GetTrafficAccessToken())
+				assert.Empty(t, sbx.GetTrafficAccessTokenExpiration())
+				assert.Zero(t, metrics.TrafficToken)
+			}
+			stored := &v1alpha1.Sandbox{}
+			require.NoError(t, fc.Get(t.Context(), types.NamespacedName{Namespace: "default", Name: sandboxName}, stored))
+			for _, value := range stored.Annotations {
+				assert.NotEqual(t, sbx.GetTrafficAccessToken(), value)
+				assert.NotEqual(t, sbx.GetTrafficAccessTokenExpiration(), value)
 			}
 		})
 	}

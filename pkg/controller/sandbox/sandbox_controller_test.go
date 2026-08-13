@@ -77,7 +77,7 @@ func TestAdd_FeatureGateDisabled(t *testing.T) {
 		_ = utilfeature.DefaultMutableFeatureGate.Set("Sandbox=true")
 	}()
 
-	err := Add(nil, nil) // manager and enqueuer are nil, but should never be accessed
+	err := Add(nil, nil, nil) // manager and enqueuer are nil, but should never be accessed
 	if err != nil {
 		t.Errorf("Add() error = %v, expected nil when feature gate is disabled", err)
 	}
@@ -92,7 +92,7 @@ func TestAdd_GVKNotDiscovered(t *testing.T) {
 	}()
 
 	// client.GetGenericClient() returns nil in test, so DiscoverGVK returns false
-	err := Add(nil, nil) // manager and enqueuer are nil, but should never be accessed
+	err := Add(nil, nil, nil) // manager and enqueuer are nil, but should never be accessed
 	if err != nil {
 		t.Errorf("Add() error = %v, expected nil when GVK is not discovered", err)
 	}
@@ -405,7 +405,7 @@ func TestSandboxReconciler_Reconcile(t *testing.T) {
 						{
 							Type:               string(agentsv1alpha1.SandboxConditionPaused),
 							Status:             metav1.ConditionTrue,
-							Reason:             agentsv1alpha1.SandboxPausedReasonDeletePod,
+							Reason:             agentsv1alpha1.SandboxPausedReasonStopPauseSucceed,
 							LastTransitionTime: metav1.Now(),
 						},
 					},
@@ -1355,6 +1355,210 @@ func TestSandboxReconciler_updateSandboxStatusWithPendingPhase(t *testing.T) {
 	}
 	if updatedSandbox.Status.UpdateRevision != "abc123" {
 		t.Errorf("Expected UpdateRevision abc123, got %v", updatedSandbox.Status.UpdateRevision)
+	}
+}
+
+func TestSandboxReconciler_preparePausedPhase(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, clientgoscheme.AddToScheme(scheme))
+	require.NoError(t, agentsv1alpha1.AddToScheme(scheme))
+
+	newCondition := func(condType string, status metav1.ConditionStatus, reason string) metav1.Condition {
+		return metav1.Condition{
+			Type:               condType,
+			Status:             status,
+			Reason:             reason,
+			LastTransitionTime: metav1.Now(),
+		}
+	}
+	pausedPending := metav1.Condition{
+		Type:   string(agentsv1alpha1.SandboxConditionPaused),
+		Status: metav1.ConditionFalse,
+		Reason: agentsv1alpha1.SandboxPausedReasonPending,
+	}
+	pausedCompleted := metav1.Condition{
+		Type:   string(agentsv1alpha1.SandboxConditionPaused),
+		Status: metav1.ConditionTrue,
+		Reason: agentsv1alpha1.SandboxPausedReasonStopPauseSucceed,
+	}
+
+	tests := []struct {
+		name           string
+		finalizers     []string
+		conditions     []metav1.Condition
+		injectPatchErr bool
+		wantErr        bool
+		wantFinalizer  bool
+		wantPaused     metav1.Condition
+		wantReady      *metav1.Condition
+	}{
+		{
+			name:          "initializes paused condition and adds finalizer",
+			wantFinalizer: true,
+			wantPaused:    pausedPending,
+		},
+		{
+			name:       "existing finalizer skips patch and flips ready to false",
+			finalizers: []string{core.SandboxFinalizer},
+			conditions: []metav1.Condition{
+				newCondition(string(agentsv1alpha1.SandboxConditionReady), metav1.ConditionTrue, "SandboxReady"),
+			},
+			wantFinalizer: true,
+			wantPaused:    pausedPending,
+			wantReady: &metav1.Condition{
+				Type:   string(agentsv1alpha1.SandboxConditionReady),
+				Status: metav1.ConditionFalse,
+				Reason: "SandboxReady",
+			},
+		},
+		{
+			name: "keeps existing paused condition and flips ready to false",
+			conditions: []metav1.Condition{
+				pausedCompleted,
+				newCondition(string(agentsv1alpha1.SandboxConditionReady), metav1.ConditionTrue, "SandboxReady"),
+			},
+			wantPaused: pausedCompleted,
+			wantReady: &metav1.Condition{
+				Type:   string(agentsv1alpha1.SandboxConditionReady),
+				Status: metav1.ConditionFalse,
+				Reason: "SandboxReady",
+			},
+		},
+		{
+			name: "ready false stays unchanged",
+			conditions: []metav1.Condition{
+				pausedCompleted,
+				newCondition(string(agentsv1alpha1.SandboxConditionReady), metav1.ConditionFalse, "SandboxNotReady"),
+			},
+			wantPaused: pausedCompleted,
+			wantReady: &metav1.Condition{
+				Type:   string(agentsv1alpha1.SandboxConditionReady),
+				Status: metav1.ConditionFalse,
+				Reason: "SandboxNotReady",
+			},
+		},
+		{
+			name:           "patch finalizer error propagates",
+			injectPatchErr: true,
+			wantErr:        true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			box := &agentsv1alpha1.Sandbox{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:       "paused-sandbox",
+					Namespace:  "default",
+					Finalizers: tt.finalizers,
+				},
+				Status: agentsv1alpha1.SandboxStatus{
+					Phase:      agentsv1alpha1.SandboxRunning,
+					Conditions: tt.conditions,
+				},
+			}
+			builder := fake.NewClientBuilder().WithScheme(scheme).WithObjects(box)
+			if tt.injectPatchErr {
+				builder = builder.WithInterceptorFuncs(interceptor.Funcs{
+					Patch: func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+						return fmt.Errorf("injected patch failure")
+					},
+				})
+			}
+			fakeClient := builder.Build()
+			reconciler := &SandboxReconciler{Client: fakeClient}
+
+			newStatus := box.Status.DeepCopy()
+			err := reconciler.preparePausedPhase(context.Background(), core.EnsureFuncArgs{Box: box, NewStatus: newStatus})
+			if tt.wantErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+
+			paused := utils.GetSandboxCondition(newStatus, string(agentsv1alpha1.SandboxConditionPaused))
+			require.NotNil(t, paused)
+			assert.Equal(t, tt.wantPaused.Status, paused.Status)
+			assert.Equal(t, tt.wantPaused.Reason, paused.Reason)
+
+			if tt.wantReady != nil {
+				ready := utils.GetSandboxCondition(newStatus, string(agentsv1alpha1.SandboxConditionReady))
+				require.NotNil(t, ready)
+				assert.Equal(t, tt.wantReady.Status, ready.Status)
+				assert.Equal(t, tt.wantReady.Reason, ready.Reason)
+			}
+
+			if tt.wantFinalizer {
+				updated := &agentsv1alpha1.Sandbox{}
+				require.NoError(t, fakeClient.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "paused-sandbox"}, updated))
+				assert.Contains(t, updated.Finalizers, core.SandboxFinalizer)
+			}
+		})
+	}
+}
+
+// TestSandboxReconciler_finalizeResumePhase verifies the common resume
+// finalization: the Paused condition is dropped from the status while other
+// conditions are preserved, and the pause finalizer is removed from the
+// sandbox when present.
+func TestSandboxReconciler_finalizeResumePhase(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, clientgoscheme.AddToScheme(scheme))
+	require.NoError(t, agentsv1alpha1.AddToScheme(scheme))
+
+	tests := []struct {
+		name       string
+		finalizers []string
+	}{
+		{
+			name:       "removes Paused condition and finalizer",
+			finalizers: []string{core.SandboxFinalizer},
+		},
+		{
+			name:       "removes Paused condition when finalizer is absent",
+			finalizers: nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			box := &agentsv1alpha1.Sandbox{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:       "resumed-sandbox",
+					Namespace:  "default",
+					Finalizers: tt.finalizers,
+				},
+			}
+			fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(box).Build()
+			reconciler := &SandboxReconciler{Client: fakeClient}
+
+			newStatus := &agentsv1alpha1.SandboxStatus{
+				Phase: agentsv1alpha1.SandboxResuming,
+				Conditions: []metav1.Condition{
+					{
+						Type:               string(agentsv1alpha1.SandboxConditionPaused),
+						Status:             metav1.ConditionTrue,
+						Reason:             agentsv1alpha1.SandboxPausedReasonStopPauseSucceed,
+						LastTransitionTime: metav1.Now(),
+					},
+					{
+						Type:               string(agentsv1alpha1.SandboxConditionResumed),
+						Status:             metav1.ConditionTrue,
+						Reason:             agentsv1alpha1.SandboxResumeReasonResumePod,
+						LastTransitionTime: metav1.Now(),
+					},
+				},
+			}
+
+			reconciler.finalizeResumePhase(context.Background(), core.EnsureFuncArgs{Box: box, NewStatus: newStatus})
+
+			assert.Nil(t, utils.GetSandboxCondition(newStatus, string(agentsv1alpha1.SandboxConditionPaused)), "expected Paused condition to be removed")
+			assert.NotNil(t, utils.GetSandboxCondition(newStatus, string(agentsv1alpha1.SandboxConditionResumed)), "expected Resumed condition to be preserved")
+
+			updated := &agentsv1alpha1.Sandbox{}
+			require.NoError(t, fakeClient.Get(context.Background(), types.NamespacedName{Namespace: box.Namespace, Name: box.Name}, updated))
+			assert.NotContains(t, updated.Finalizers, core.SandboxFinalizer)
+		})
 	}
 }
 
@@ -2933,6 +3137,112 @@ func TestCalculateStatus(t *testing.T) {
 			},
 		},
 		{
+			name: "post-upgrade with spec.paused=true should re-pause",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-sandbox",
+					Namespace: "default",
+				},
+				Status: corev1.PodStatus{
+					Phase: corev1.PodRunning,
+					Conditions: []corev1.PodCondition{
+						{Type: corev1.PodReady, Status: corev1.ConditionTrue},
+					},
+				},
+			},
+			box: &agentsv1alpha1.Sandbox{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:       "test-sandbox",
+					Namespace:  "default",
+					Generation: 1,
+				},
+				Spec: agentsv1alpha1.SandboxSpec{
+					Paused: true,
+					EmbeddedSandboxTemplate: agentsv1alpha1.EmbeddedSandboxTemplate{
+						Template: &corev1.PodTemplateSpec{
+							Spec: corev1.PodSpec{
+								Containers: []corev1.Container{{Name: "test", Image: "nginx"}},
+							},
+						},
+					},
+				},
+			},
+			initStatus: &agentsv1alpha1.SandboxStatus{
+				Phase: agentsv1alpha1.SandboxRunning,
+				Conditions: []metav1.Condition{
+					{
+						Type:   string(agentsv1alpha1.SandboxConditionUpgrading),
+						Status: metav1.ConditionTrue,
+						Reason: agentsv1alpha1.SandboxUpgradingReasonSucceeded,
+					},
+					{
+						Type:   string(agentsv1alpha1.SandboxConditionReady),
+						Status: metav1.ConditionTrue,
+						Reason: agentsv1alpha1.SandboxReadyReasonPodReady,
+					},
+				},
+			},
+			expectedPhase:     agentsv1alpha1.SandboxPaused,
+			expectedShouldReq: false,
+			checkConditions: func(t *testing.T, status *agentsv1alpha1.SandboxStatus) {
+				// Should remove Resumed condition (exclusive with Paused)
+				for _, cond := range status.Conditions {
+					if cond.Type == string(agentsv1alpha1.SandboxConditionResumed) {
+						t.Errorf("Resumed condition should be removed when re-pausing")
+					}
+				}
+			},
+		},
+		{
+			name: "post-upgrade with spec.paused=false should stay running",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-sandbox",
+					Namespace: "default",
+				},
+				Status: corev1.PodStatus{
+					Phase: corev1.PodRunning,
+					Conditions: []corev1.PodCondition{
+						{Type: corev1.PodReady, Status: corev1.ConditionTrue},
+					},
+				},
+			},
+			box: &agentsv1alpha1.Sandbox{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:       "test-sandbox",
+					Namespace:  "default",
+					Generation: 1,
+				},
+				Spec: agentsv1alpha1.SandboxSpec{
+					Paused: false,
+					EmbeddedSandboxTemplate: agentsv1alpha1.EmbeddedSandboxTemplate{
+						Template: &corev1.PodTemplateSpec{
+							Spec: corev1.PodSpec{
+								Containers: []corev1.Container{{Name: "test", Image: "nginx"}},
+							},
+						},
+					},
+				},
+			},
+			initStatus: &agentsv1alpha1.SandboxStatus{
+				Phase: agentsv1alpha1.SandboxRunning,
+				Conditions: []metav1.Condition{
+					{
+						Type:   string(agentsv1alpha1.SandboxConditionUpgrading),
+						Status: metav1.ConditionTrue,
+						Reason: agentsv1alpha1.SandboxUpgradingReasonSucceeded,
+					},
+					{
+						Type:   string(agentsv1alpha1.SandboxConditionReady),
+						Status: metav1.ConditionTrue,
+						Reason: agentsv1alpha1.SandboxReadyReasonPodReady,
+					},
+				},
+			},
+			expectedPhase:     agentsv1alpha1.SandboxRunning,
+			expectedShouldReq: false,
+		},
+		{
 			name: "paused phase with paused condition true and not paused spec should set to resuming",
 			pod: &corev1.Pod{
 				ObjectMeta: metav1.ObjectMeta{
@@ -2972,12 +3282,11 @@ func TestCalculateStatus(t *testing.T) {
 			expectedPhase:     agentsv1alpha1.SandboxResuming,
 			expectedShouldReq: false,
 			checkConditions: func(t *testing.T, status *agentsv1alpha1.SandboxStatus) {
-				// Should remove paused condition
-				for _, cond := range status.Conditions {
-					if cond.Type == string(agentsv1alpha1.SandboxConditionPaused) {
-						t.Errorf("Paused condition should be removed")
-					}
-				}
+				// Paused condition must be preserved — the Resuming stage reads
+				// its reason to dispatch the matching resume strategy. It is
+				// removed only after resume succeeds.
+				pausedCond := utils.GetSandboxCondition(status, string(agentsv1alpha1.SandboxConditionPaused))
+				require.NotNil(t, pausedCond, "Paused condition should be preserved when entering Resuming")
 				// Should add resumed condition with false status
 				found := false
 				for _, cond := range status.Conditions {
@@ -3023,6 +3332,9 @@ func TestCalculateStatus(t *testing.T) {
 						},
 					},
 				},
+				Status: agentsv1alpha1.SandboxStatus{
+					UpdateRevision: "old-hash",
+				},
 			},
 			initStatus: &agentsv1alpha1.SandboxStatus{
 				Phase: agentsv1alpha1.SandboxPaused,
@@ -3035,6 +3347,177 @@ func TestCalculateStatus(t *testing.T) {
 			},
 			expectedPhase:     agentsv1alpha1.SandboxPaused,
 			expectedShouldReq: false,
+			checkConditions: func(t *testing.T, status *agentsv1alpha1.SandboxStatus) {
+				// While pausing, UpdateRevision must be preserved so that
+				// template changes can be detected once the pause completes.
+				assert.Equal(t, "old-hash", status.UpdateRevision,
+					"UpdateRevision should be preserved while pausing")
+			},
+		},
+		{
+			name: "paused still pausing with template change should preserve old UpdateRevision for later detection",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-sandbox",
+					Namespace: "default",
+				},
+				Status: corev1.PodStatus{
+					Phase: corev1.PodRunning,
+				},
+			},
+			box: &agentsv1alpha1.Sandbox{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:       "test-sandbox",
+					Namespace:  "default",
+					Generation: 2,
+				},
+				Spec: agentsv1alpha1.SandboxSpec{
+					Paused: true,
+					UpgradePolicy: &agentsv1alpha1.SandboxUpgradePolicy{
+						Type: agentsv1alpha1.SandboxUpgradePolicyRecreate,
+					},
+					EmbeddedSandboxTemplate: agentsv1alpha1.EmbeddedSandboxTemplate{
+						Template: &corev1.PodTemplateSpec{
+							Spec: corev1.PodSpec{
+								Containers: []corev1.Container{{Name: "test", Image: "nginx:v2"}},
+							},
+						},
+					},
+				},
+				Status: agentsv1alpha1.SandboxStatus{
+					UpdateRevision: "old-hash",
+				},
+			},
+			initStatus: &agentsv1alpha1.SandboxStatus{
+				Phase: agentsv1alpha1.SandboxPaused,
+				Conditions: []metav1.Condition{
+					{
+						Type:   string(agentsv1alpha1.SandboxConditionPaused),
+						Status: metav1.ConditionFalse,
+						Reason: agentsv1alpha1.SandboxPausedReasonPending,
+					},
+				},
+			},
+			expectedPhase:     agentsv1alpha1.SandboxPaused,
+			expectedShouldReq: false,
+			checkConditions: func(t *testing.T, status *agentsv1alpha1.SandboxStatus) {
+				// UpdateRevision must be the OLD value, not the new hash,
+				// so that when pause completes the template change is detected.
+				assert.Equal(t, "old-hash", status.UpdateRevision,
+					"UpdateRevision should be preserved as old-hash while pausing, "+
+						"got %s which would prevent upgrade detection after pause", status.UpdateRevision)
+			},
+		},
+		{
+			name: "paused with resume trigger annotation should transition to upgrading",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-sandbox",
+					Namespace: "default",
+				},
+				Status: corev1.PodStatus{
+					Phase: corev1.PodRunning,
+				},
+			},
+			box: &agentsv1alpha1.Sandbox{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:       "test-sandbox",
+					Namespace:  "default",
+					Generation: 1,
+					Annotations: map[string]string{
+						agentsv1alpha1.AnnotationUpgradeResumeTrigger: agentsv1alpha1.True,
+					},
+				},
+				Spec: agentsv1alpha1.SandboxSpec{
+					Paused: true,
+					EmbeddedSandboxTemplate: agentsv1alpha1.EmbeddedSandboxTemplate{
+						Template: &corev1.PodTemplateSpec{
+							Spec: corev1.PodSpec{
+								Containers: []corev1.Container{{Name: "test", Image: "nginx"}},
+							},
+						},
+					},
+				},
+			},
+			initStatus: &agentsv1alpha1.SandboxStatus{
+				Phase: agentsv1alpha1.SandboxPaused,
+				Conditions: []metav1.Condition{
+					{
+						Type:   string(agentsv1alpha1.SandboxConditionPaused),
+						Status: metav1.ConditionTrue,
+					},
+					{
+						Type:   string(agentsv1alpha1.SandboxConditionUpgrading),
+						Status: metav1.ConditionTrue,
+					},
+				},
+			},
+			expectedPhase:     agentsv1alpha1.SandboxUpgrading,
+			expectedShouldReq: false,
+			checkConditions: func(t *testing.T, status *agentsv1alpha1.SandboxStatus) {
+				// Upgrading condition should be removed so the upgrade flow
+				// starts fresh from the Resuming stage.
+				upgradingCond := utils.GetSandboxCondition(status, string(agentsv1alpha1.SandboxConditionUpgrading))
+				assert.Nil(t, upgradingCond, "Upgrading condition should be removed when resume trigger fires")
+				// Paused condition must be preserved — the upgrade Resuming stage
+				// relies on it to decide whether to wake the sandbox first.
+				pausedCond := utils.GetSandboxCondition(status, string(agentsv1alpha1.SandboxConditionPaused))
+				require.NotNil(t, pausedCond, "Paused condition should be preserved")
+				assert.Equal(t, metav1.ConditionTrue, pausedCond.Status)
+			},
+		},
+		{
+			name: "paused with spec.Paused=false (un-pause) should transition to resuming, not trigger upgrade",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-sandbox",
+					Namespace: "default",
+				},
+				Status: corev1.PodStatus{
+					Phase: corev1.PodRunning,
+				},
+			},
+			box: &agentsv1alpha1.Sandbox{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:       "test-sandbox",
+					Namespace:  "default",
+					Generation: 1,
+					Annotations: map[string]string{
+						agentsv1alpha1.AnnotationUpgradeResumeTrigger: agentsv1alpha1.True,
+					},
+				},
+				Spec: agentsv1alpha1.SandboxSpec{
+					Paused: false,
+					EmbeddedSandboxTemplate: agentsv1alpha1.EmbeddedSandboxTemplate{
+						Template: &corev1.PodTemplateSpec{
+							Spec: corev1.PodSpec{
+								Containers: []corev1.Container{{Name: "test", Image: "nginx"}},
+							},
+						},
+					},
+				},
+			},
+			initStatus: &agentsv1alpha1.SandboxStatus{
+				Phase: agentsv1alpha1.SandboxPaused,
+				Conditions: []metav1.Condition{
+					{
+						Type:   string(agentsv1alpha1.SandboxConditionPaused),
+						Status: metav1.ConditionTrue,
+					},
+				},
+			},
+			expectedPhase:     agentsv1alpha1.SandboxResuming,
+			expectedShouldReq: false,
+			checkConditions: func(t *testing.T, status *agentsv1alpha1.SandboxStatus) {
+				// Un-pause takes priority over the resume trigger annotation.
+				// The Paused condition is preserved so the Resuming stage can
+				// dispatch the matching resume strategy from its reason.
+				pausedCond := utils.GetSandboxCondition(status, string(agentsv1alpha1.SandboxConditionPaused))
+				require.NotNil(t, pausedCond, "Paused condition should be preserved when un-pausing")
+				resumedCond := utils.GetSandboxCondition(status, string(agentsv1alpha1.SandboxConditionResumed))
+				require.NotNil(t, resumedCond, "Resumed condition should be added")
+				assert.Equal(t, metav1.ConditionFalse, resumedCond.Status)
+			},
 		},
 		{
 			name: "running phase with running pod should stay running",
@@ -3103,6 +3586,48 @@ func TestCalculateStatus(t *testing.T) {
 			expectedPhase:     agentsv1alpha1.SandboxFailed,
 			expectedMessage:   "Pod status phase is Failed",
 			expectedShouldReq: true,
+		},
+		{
+			name: "pending phase with terminal pod owned by previous sandbox generation should stay pending",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-sandbox",
+					Namespace: "default",
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							APIVersion: agentsv1alpha1.SchemeGroupVersion.String(),
+							Kind:       "Sandbox",
+							Name:       "test-sandbox",
+							UID:        "old-uid",
+						},
+					},
+				},
+				Status: corev1.PodStatus{
+					Phase: corev1.PodFailed,
+				},
+			},
+			box: &agentsv1alpha1.Sandbox{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:       "test-sandbox",
+					Namespace:  "default",
+					UID:        "current-uid",
+					Generation: 1,
+				},
+				Spec: agentsv1alpha1.SandboxSpec{
+					EmbeddedSandboxTemplate: agentsv1alpha1.EmbeddedSandboxTemplate{
+						Template: &corev1.PodTemplateSpec{
+							Spec: corev1.PodSpec{
+								Containers: []corev1.Container{{Name: "test", Image: "nginx"}},
+							},
+						},
+					},
+				},
+			},
+			initStatus: &agentsv1alpha1.SandboxStatus{
+				Phase: agentsv1alpha1.SandboxPending,
+			},
+			expectedPhase:     agentsv1alpha1.SandboxPending,
+			expectedShouldReq: false,
 		},
 		{
 			name: "running phase with hash mismatch and recreate policy should transition to upgrading and remove upgrading condition",
@@ -5648,7 +6173,7 @@ func TestRejectCleanup(t *testing.T) {
 		r := &SandboxReconciler{recorder: recorder}
 		status := &agentsv1alpha1.SandboxStatus{}
 
-		r.rejectRecycle(box, status, "test reason")
+		r.rejectRecycle(context.Background(), box, status, "test reason")
 
 		cond := utils.GetSandboxCondition(status, string(agentsv1alpha1.SandboxConditionRecycling))
 		require.NotNil(t, cond)
@@ -5671,7 +6196,7 @@ func TestRejectCleanup(t *testing.T) {
 		status := &agentsv1alpha1.SandboxStatus{}
 
 		assert.NotPanics(t, func() {
-			r.rejectRecycle(box, status, "test reason")
+			r.rejectRecycle(context.Background(), box, status, "test reason")
 		})
 
 		cond := utils.GetSandboxCondition(status, string(agentsv1alpha1.SandboxConditionRecycling))
@@ -5685,10 +6210,10 @@ func TestRejectCleanup(t *testing.T) {
 		status := &agentsv1alpha1.SandboxStatus{}
 
 		// First call sets the condition and records an event
-		r.rejectRecycle(box, status, "test reason")
+		r.rejectRecycle(context.Background(), box, status, "test reason")
 
 		// Second call with same reason+message should be a no-op
-		r.rejectRecycle(box, status, "test reason")
+		r.rejectRecycle(context.Background(), box, status, "test reason")
 
 		// Only one event should have been recorded
 		select {
@@ -5710,8 +6235,8 @@ func TestRejectCleanup(t *testing.T) {
 		r := &SandboxReconciler{recorder: recorder}
 		status := &agentsv1alpha1.SandboxStatus{}
 
-		r.rejectRecycle(box, status, "reason A")
-		r.rejectRecycle(box, status, "reason B")
+		r.rejectRecycle(context.Background(), box, status, "reason A")
+		r.rejectRecycle(context.Background(), box, status, "reason B")
 
 		cond := utils.GetSandboxCondition(status, string(agentsv1alpha1.SandboxConditionRecycling))
 		require.NotNil(t, cond)
@@ -5729,4 +6254,114 @@ func TestRejectCleanup(t *testing.T) {
 			t.Error("expected second event")
 		}
 	})
+}
+
+func TestDetermineUpgradeResumeReason(t *testing.T) {
+	// Enable the feature gate so the switch statement is exercised.
+	_ = utilfeature.DefaultMutableFeatureGate.Set("SandboxUpgradeResumeFromFailedStepGate=true")
+	defer func() {
+		_ = utilfeature.DefaultMutableFeatureGate.Set("SandboxUpgradeResumeFromFailedStepGate=false")
+	}()
+
+	newStatus := &agentsv1alpha1.SandboxStatus{UpdateRevision: "new-hash"}
+	podWithHash := func(hash string) *corev1.Pod {
+		return &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{
+			agentsv1alpha1.PodLabelTemplateHash: hash,
+		}}}
+	}
+
+	tests := []struct {
+		name        string
+		upgradeCond *metav1.Condition
+		pod         *corev1.Pod
+		expected    string
+	}{
+		{
+			name:        "nil condition returns PreUpgrade",
+			upgradeCond: nil,
+			pod:         nil,
+			expected:    agentsv1alpha1.SandboxUpgradingReasonPreUpgrade,
+		},
+		{
+			name: "Resuming returns Resuming",
+			upgradeCond: &metav1.Condition{
+				Reason: agentsv1alpha1.SandboxUpgradingReasonResuming,
+			},
+			pod:      nil,
+			expected: agentsv1alpha1.SandboxUpgradingReasonResuming,
+		},
+		{
+			name: "ResumeSucceed returns PreUpgrade",
+			upgradeCond: &metav1.Condition{
+				Reason: agentsv1alpha1.SandboxUpgradingReasonResumeSucceed,
+			},
+			pod:      nil,
+			expected: agentsv1alpha1.SandboxUpgradingReasonPreUpgrade,
+		},
+		{
+			name: "PreUpgradeFailed returns PreUpgrade",
+			upgradeCond: &metav1.Condition{
+				Reason: agentsv1alpha1.SandboxUpgradingReasonPreUpgradeFailed,
+			},
+			pod:      nil,
+			expected: agentsv1alpha1.SandboxUpgradingReasonPreUpgrade,
+		},
+		{
+			name: "UpgradePodFailed returns UpgradePod",
+			upgradeCond: &metav1.Condition{
+				Reason: agentsv1alpha1.SandboxUpgradingReasonUpgradePodFailed,
+			},
+			pod:      nil,
+			expected: agentsv1alpha1.SandboxUpgradingReasonUpgradePod,
+		},
+		{
+			name: "PostUpgradeFailed with matching pod hash returns PostUpgrade",
+			upgradeCond: &metav1.Condition{
+				Reason: agentsv1alpha1.SandboxUpgradingReasonPostUpgradeFailed,
+			},
+			pod:      podWithHash("new-hash"),
+			expected: agentsv1alpha1.SandboxUpgradingReasonPostUpgrade,
+		},
+		{
+			name: "PostUpgradeFailed with mismatched pod hash returns UpgradePod",
+			upgradeCond: &metav1.Condition{
+				Reason: agentsv1alpha1.SandboxUpgradingReasonPostUpgradeFailed,
+			},
+			pod:      podWithHash("old-hash"),
+			expected: agentsv1alpha1.SandboxUpgradingReasonUpgradePod,
+		},
+		{
+			name: "PostUpgradeFailed with nil pod returns UpgradePod",
+			upgradeCond: &metav1.Condition{
+				Reason: agentsv1alpha1.SandboxUpgradingReasonPostUpgradeFailed,
+			},
+			pod:      nil,
+			expected: agentsv1alpha1.SandboxUpgradingReasonUpgradePod,
+		},
+		{
+			name: "unknown reason returns PreUpgrade (default)",
+			upgradeCond: &metav1.Condition{
+				Reason: "SomeUnknownReason",
+			},
+			pod:      nil,
+			expected: agentsv1alpha1.SandboxUpgradingReasonPreUpgrade,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := determineUpgradeResumeReason(tt.pod, newStatus, tt.upgradeCond)
+			assert.Equal(t, tt.expected, result)
+		})
+	}
+}
+
+func TestSandboxPhaseEventReason_EmptyPhase(t *testing.T) {
+	assert.Equal(t, "SandboxPhaseChanged", sandboxPhaseEventReason(""))
+	assert.Equal(t, "SandboxRunning", sandboxPhaseEventReason(agentsv1alpha1.SandboxRunning))
+}
+
+func TestPhaseForEvent_EmptyPhase(t *testing.T) {
+	assert.Equal(t, "<empty>", phaseForEvent(""))
+	assert.Equal(t, string(agentsv1alpha1.SandboxRunning), phaseForEvent(agentsv1alpha1.SandboxRunning))
 }

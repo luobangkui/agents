@@ -17,6 +17,7 @@ limitations under the License.
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"net/http"         // Added for pprof server
@@ -30,16 +31,20 @@ import (
 	zapRaw "go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	"k8s.io/klog/v2"
+	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
+	agentsclient "github.com/openkruise/agents/client"
 	"github.com/openkruise/agents/pkg/sandbox-manager/clients"
 	"github.com/openkruise/agents/pkg/sandbox-manager/config"
 	"github.com/openkruise/agents/pkg/sandbox-manager/consts"
 	"github.com/openkruise/agents/pkg/servers/e2b"
 	"github.com/openkruise/agents/pkg/servers/e2b/keys"
 	"github.com/openkruise/agents/pkg/servers/e2b/models"
+	"github.com/openkruise/agents/pkg/tracing"
 	"github.com/openkruise/agents/pkg/utils"
 	utilfeature "github.com/openkruise/agents/pkg/utils/feature"
+	utilruntime "github.com/openkruise/agents/pkg/utils/runtime"
 )
 
 const (
@@ -76,6 +81,8 @@ func main() {
 	var e2bEnableAuth bool
 	var domain string
 	var e2bMaxTimeout int
+	var enableShortSandboxID bool
+	var shortSandboxIDPrefix string
 	var e2bMinResumeTimeout int
 	var sysNs string
 	var peerSelector string
@@ -96,6 +103,7 @@ func main() {
 	var quotaRedisBreakerD time.Duration
 	var quotaAntiDriftInterval time.Duration
 	var quotaAntiDriftGrace time.Duration
+	var runtimeClientCertSecret string
 
 	utilfeature.DefaultMutableFeatureGate.AddFlag(pflag.CommandLine)
 
@@ -112,6 +120,14 @@ func main() {
 			"the HTTP Host header (api. prefix stripped for native paths; host "+
 			"preserved for /kruise/* customized paths).")
 	pflag.IntVar(&e2bMaxTimeout, "e2b-max-timeout", models.DefaultMaxTimeout, "E2B maximum timeout in seconds")
+	pflag.BoolVar(&enableShortSandboxID, "enable-short-sandbox-id", false, "Assign short IDs to successfully claimed or cloned Sandboxes")
+	pflag.StringVar(&shortSandboxIDPrefix, "short-sandbox-id-prefix", "",
+		"Prefix prepended verbatim to newly assigned short Sandbox IDs when --enable-short-sandbox-id is set; "+
+			"must start with a lowercase letter or digit and otherwise contain only lowercase letters, digits, or hyphens; "+
+			"must not contain the legacy ID separator --; "+
+			"at most 50 characters (validated at startup: prefix plus the 13-character short ID must fit a 63-character Kubernetes label value); "+
+			"with Native E2B dynamic domains (<port>-<sandbox-id>.<domain>) keep the prefix at 44 characters or fewer so the DNS label stays valid; during mixed-version rollout keep it at 37 characters or fewer; the customized path is not subject to this DNS limit; "+
+			"use the same value on every sandbox-manager replica")
 	pflag.IntVar(&e2bMinResumeTimeout, "e2b-min-resume-timeout", models.DefaultMinResumeTimeoutSeconds,
 		"Minimum value (seconds) for the timeout parameter carried by the E2B connect API; "+
 			"timeout values below this floor will be raised to this value.")
@@ -137,6 +153,13 @@ func main() {
 	pflag.DurationVar(&quotaRedisBreakerD, "quota-redis-breaker-open-duration", consts.DefaultQuotaRedisBreakerD, "How long the Redis quota fail-open breaker stays open before probing again.")
 	pflag.DurationVar(&quotaAntiDriftInterval, "quota-anti-drift-interval", consts.DefaultQuotaAntiDriftInterval, "Interval for quota anti-drift reconciliation.")
 	pflag.DurationVar(&quotaAntiDriftGrace, "quota-anti-drift-grace", consts.DefaultQuotaAntiDriftGrace, "Grace period before periodic quota anti-drift releases suspected leaked entries.")
+	pflag.StringVar(&runtimeClientCertSecret, "runtime-client-cert-secret", "",
+		"namespace/name of the Secret holding the agent-runtime client TLS bundle. Leave it empty to disable the runtime mTLS.")
+
+	// Tracing flags (definitions shared with agent-sandbox-controller via
+	// tracing.Config.BindFlags; pulled into pflag by AddGoFlagSet below)
+	var tracingCfg tracing.Config
+	tracingCfg.BindFlags(flag.CommandLine)
 
 	opts := zap.Options{
 		Development: false,
@@ -247,6 +270,50 @@ func main() {
 		klog.Fatalf("Failed to initialize Kubernetes client: %v", err)
 	}
 
+	// Initialize tracing
+	tracingCfg.ServiceName = "sandbox-manager"
+	tracingShutdown, err := tracing.InitTracerProvider(context.Background(), tracingCfg)
+	if err != nil {
+		klog.Fatalf("Failed to initialize tracing: %v", err)
+	}
+	defer func() {
+		if err := tracingShutdown(context.Background()); err != nil {
+			klog.Errorf("Failed to shutdown tracing: %v", err)
+		}
+	}()
+
+	// Initialize the generic client registry so CRD discovery
+	// (discovery.DiscoverGVK) works; the shared cache uses it to skip
+	// optional CRD-dependent setup when a CRD is not installed.
+	if err := agentsclient.NewRegistry(clientConfig); err != nil {
+		klog.Fatalf("Failed to initialize generic client registry: %v", err)
+	}
+
+	// Load the runtime client TLS bundle. The certificate Secret is fetched once
+	// at startup (fail fast on a broken reference) and held for the lifetime of
+	// the process: the material is long-lived and static, so a replacement is
+	// picked up by the next restart.
+	var runtimeTLSBundle *utilruntime.TLSBundle
+	if runtimeClientCertSecret != "" {
+		secretNamespace, secretName, found := strings.Cut(runtimeClientCertSecret, "/")
+		if !found || secretNamespace == "" || secretName == "" {
+			klog.Fatalf("--runtime-client-cert-secret must be in namespace/name form, got %q", runtimeClientCertSecret)
+		}
+		secretReader, err := ctrlclient.New(clientConfig, ctrlclient.Options{})
+		if err != nil {
+			klog.Fatalf("Failed to create client for the runtime client TLS bundle: %v", err)
+		}
+		loadCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		runtimeTLSBundle, err = utilruntime.NewTLSBundleFromSecret(loadCtx, secretReader, secretNamespace, secretName)
+		cancel()
+		if err != nil {
+			klog.Fatalf("Failed to load the runtime client TLS bundle: %v", err)
+		}
+		klog.InfoS("runtime client TLS enabled", "secret", runtimeClientCertSecret)
+	} else {
+		klog.InfoS("runtime client TLS disabled, using the legacy plaintext runtime paths")
+	}
+
 	var keyCfg *keys.Config
 	if e2bEnableAuth {
 		keyCfg = &keys.Config{
@@ -259,8 +326,28 @@ func main() {
 		}
 	}
 
-	sandboxController := e2b.NewController(domain, sysNs, peerSelector, sandboxNamespace, sandboxLabelSelector, e2bMaxTimeout, e2bMinResumeTimeout, maxClaimWorkers, maxCreateQPS, uint32(extProcMaxConcurrency),
-		port, memberlistBindPort, keyCfg, clientConfig, quotaOpts)
+	sandboxController := e2b.NewController(e2b.ControllerOptions{
+		Domain:           domain,
+		Port:             port,
+		MaxTimeout:       e2bMaxTimeout,
+		MinResumeTimeout: e2bMinResumeTimeout,
+		KeyConfig:        keyCfg,
+		Manager: config.SandboxManagerOptions{
+			SystemNamespace:       sysNs,
+			PeerSelector:          peerSelector,
+			SandboxNamespace:      sandboxNamespace,
+			SandboxLabelSelector:  sandboxLabelSelector,
+			MaxClaimWorkers:       maxClaimWorkers,
+			MaxCreateQPS:          maxCreateQPS,
+			ExtProcMaxConcurrency: uint32(extProcMaxConcurrency),
+			MemberlistBindPort:    memberlistBindPort,
+			EnableShortSandboxID:  enableShortSandboxID,
+			ShortSandboxIDPrefix:  shortSandboxIDPrefix,
+			RestConfig:            clientConfig,
+			Quota:                 quotaOpts,
+		},
+		RuntimeTLSBundle: runtimeTLSBundle,
+	})
 
 	if err := sandboxController.Init(); err != nil {
 		klog.Fatalf("Failed to initialize sandbox controller: %v", err)

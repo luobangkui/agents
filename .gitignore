@@ -221,3 +221,7 @@ REVIEW.md
 .DS_Store
 .qoder/repowiki
 .superpowers
+*.tar
+analysis/
+
+.gocache/

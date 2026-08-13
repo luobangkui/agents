@@ -42,6 +42,7 @@ import (
 	"github.com/openkruise/agents/pkg/sandbox-manager/infra/sandboxcr"
 	"github.com/openkruise/agents/pkg/utils/csiutils"
 	utilfeature "github.com/openkruise/agents/pkg/utils/feature"
+	runtimeclient "github.com/openkruise/agents/pkg/utils/runtime"
 )
 
 func TestNewCommonControl(t *testing.T) {
@@ -55,7 +56,7 @@ func TestNewCommonControl(t *testing.T) {
 	fakeRecorder := record.NewFakeRecorder(10)
 
 	// NewCommonControl should handle nil cache/client gracefully
-	control := NewCommonControl(fakeClient, fakeRecorder, nil)
+	control := NewCommonControl(fakeClient, fakeRecorder, nil, nil)
 
 	require.NotNil(t, control, "NewCommonControl() returned nil")
 
@@ -122,7 +123,7 @@ func TestNewClaimControl(t *testing.T) {
 
 	fakeRecorder := record.NewFakeRecorder(10)
 
-	controls := NewClaimControl(fakeClient, fakeRecorder, nil)
+	controls := NewClaimControl(fakeClient, fakeRecorder, nil, nil)
 
 	require.NotNil(t, controls, "NewClaimControl() returned nil")
 
@@ -133,6 +134,29 @@ func TestNewClaimControl(t *testing.T) {
 
 	// Verify it implements the interface
 	var _ ClaimControl = commonControl
+}
+
+// TestNewClaimControl_ForwardsRuntimeTLSBundle pins the bundle handoff from
+// NewClaimControl down to the concrete control. commonControl is the only place
+// that can supply the bundle to TryClaimSandbox, so a dropped argument here
+// would silently reintroduce failing claims for TLS-capable sandboxes.
+func TestNewClaimControl_ForwardsRuntimeTLSBundle(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = agentsv1alpha1.AddToScheme(scheme)
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		Build()
+
+	bundle := &runtimeclient.TLSBundle{CABundle: []byte("test-ca")}
+
+	controls := NewClaimControl(fakeClient, record.NewFakeRecorder(10), nil, bundle)
+
+	control, exists := controls[CommonControlName]
+	require.True(t, exists, "NewClaimControl() missing CommonControlName key")
+	cc, ok := control.(*commonControl)
+	require.True(t, ok, "CommonControlName should map to *commonControl")
+	assert.Same(t, bundle, cc.runtimeTLSBundle, "runtime TLS bundle must be forwarded to commonControl")
 }
 
 func TestCommonControl_EnsureClaimClaiming(t *testing.T) {
@@ -419,7 +443,7 @@ func TestCommonControl_EnsureClaimClaiming(t *testing.T) {
 
 			fakeRecorder := record.NewFakeRecorder(100)
 
-			control := NewCommonControl(fakeClient, fakeRecorder, cache)
+			control := NewCommonControl(fakeClient, fakeRecorder, cache, nil)
 
 			args := ClaimArgs{
 				Claim:      tt.claim,
@@ -522,7 +546,7 @@ func TestCommonControl_EnsureClaimClaiming_ClaimedGreaterThanZero(t *testing.T) 
 
 	ctx := context.Background()
 	fakeRecorder := record.NewFakeRecorder(100)
-	control := NewCommonControl(fakeClient, fakeRecorder, cache)
+	control := NewCommonControl(fakeClient, fakeRecorder, cache, nil)
 
 	newStatus := &agentsv1alpha1.SandboxClaimStatus{
 		Phase:           agentsv1alpha1.SandboxClaimPhaseClaiming,
@@ -595,7 +619,7 @@ func TestCommonControl_EnsureClaimClaiming_CPUResizeFeatureGatePrecondition(t *t
 			Phase: agentsv1alpha1.SandboxClaimPhaseClaiming,
 		}
 
-		control := NewCommonControl(fakeClient, record.NewFakeRecorder(10), cache)
+		control := NewCommonControl(fakeClient, record.NewFakeRecorder(10), cache, nil)
 
 		strategy, err := control.EnsureClaimClaiming(t.Context(), ClaimArgs{
 			Claim:      claim,
@@ -626,7 +650,7 @@ func TestCommonControl_EnsureClaimClaiming_CPUResizeFeatureGatePrecondition(t *t
 			Phase: agentsv1alpha1.SandboxClaimPhaseClaiming,
 		}
 
-		control := NewCommonControl(fakeClient, record.NewFakeRecorder(10), cache)
+		control := NewCommonControl(fakeClient, record.NewFakeRecorder(10), cache, nil)
 
 		strategy, err := control.EnsureClaimClaiming(t.Context(), ClaimArgs{
 			Claim:      claim,
@@ -771,7 +795,7 @@ func TestCommonControl_EnsureClaimCompleted(t *testing.T) {
 
 			fakeRecorder := record.NewFakeRecorder(10)
 
-			control := NewCommonControl(fakeClient, fakeRecorder, nil)
+			control := NewCommonControl(fakeClient, fakeRecorder, nil, nil)
 
 			args := ClaimArgs{
 				Claim:     tt.claim,
@@ -828,12 +852,16 @@ func TestCommonControl_buildClaimOptions(t *testing.T) {
 	timeoutDuration := metav1.Duration{Duration: 3 * time.Minute}
 
 	tests := []struct {
-		name        string
-		claim       *agentsv1alpha1.SandboxClaim
-		sandboxSet  *agentsv1alpha1.SandboxSet
-		initObjs    []client.Object
-		expectError bool
-		validate    func(t *testing.T, opts infra.ClaimSandboxOptions)
+		name                string
+		claim               *agentsv1alpha1.SandboxClaim
+		sandboxSet          *agentsv1alpha1.SandboxSet
+		initObjs            []client.Object
+		expectError         bool
+		expectErrorContains string
+		// runtimeTLSBundle is the bundle handed to NewCommonControl; nil keeps
+		// the control on the legacy plaintext runtime paths.
+		runtimeTLSBundle *runtimeclient.TLSBundle
+		validate         func(t *testing.T, opts infra.ClaimSandboxOptions)
 	}{
 		{
 			name: "basic claim without optional fields",
@@ -872,7 +900,7 @@ func TestCommonControl_buildClaimOptions(t *testing.T) {
 						},
 					},
 				}
-				opts.Modifier(mockSandbox)
+				require.NoError(t, opts.Modifier(mockSandbox))
 
 				// Verify modifier set the claim name label correctly
 				assert.Equal(t, "test-claim", mockSandbox.Labels[agentsv1alpha1.LabelSandboxClaimName], "LabelSandboxClaimName mismatch")
@@ -921,7 +949,7 @@ func TestCommonControl_buildClaimOptions(t *testing.T) {
 						},
 					},
 				}
-				opts.Modifier(mockSandbox)
+				require.NoError(t, opts.Modifier(mockSandbox))
 
 				// Verify modifier set labels and annotations correctly
 				assert.Equal(t, "test-claim", mockSandbox.Labels[agentsv1alpha1.LabelSandboxClaimName], "LabelSandboxClaimName mismatch")
@@ -964,7 +992,7 @@ func TestCommonControl_buildClaimOptions(t *testing.T) {
 						},
 					},
 				}
-				opts.Modifier(mockSandbox)
+				require.NoError(t, opts.Modifier(mockSandbox))
 
 				// Verify modifier set the claim name label and shutdown annotation
 				assert.Equal(t, "test-claim", mockSandbox.Labels[agentsv1alpha1.LabelSandboxClaimName], "LabelSandboxClaimName mismatch")
@@ -1613,6 +1641,114 @@ func TestCommonControl_buildClaimOptions(t *testing.T) {
 			},
 			expectError: true,
 		},
+		{
+			// The control calls sandboxcr.TryClaimSandbox directly and thus
+			// bypasses the Infra-level bundle injection, so the configured
+			// bundle must reach the options or claiming a TLS-capable sandbox
+			// fails in runtime.TransportOptionsFor.
+			name: "runtime TLS bundle is propagated to claim options",
+			claim: &agentsv1alpha1.SandboxClaim{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-claim-tls",
+					Namespace: "default",
+					UID:       "test-uid-tls",
+				},
+				Spec: agentsv1alpha1.SandboxClaimSpec{
+					TemplateName: "test-template",
+				},
+			},
+			sandboxSet: &agentsv1alpha1.SandboxSet{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-template",
+					Namespace: "default",
+				},
+			},
+			// A syntactically invalid CABundle is fine here: buildClaimOptions
+			// only forwards the pointer and never decodes the PEM. Tests that
+			// actually dial the runtime need a real bundle instead.
+			runtimeTLSBundle: &runtimeclient.TLSBundle{CABundle: []byte("test-ca")},
+			expectError:      false,
+			validate: func(t *testing.T, opts infra.ClaimSandboxOptions) {
+				require.NotNil(t, opts.RuntimeTLSBundle, "RuntimeTLSBundle should be propagated from the control")
+				assert.Equal(t, []byte("test-ca"), opts.RuntimeTLSBundle.CABundle, "RuntimeTLSBundle.CABundle mismatch")
+			},
+		},
+		{
+			name: "nil runtime TLS bundle leaves claim options without a bundle",
+			claim: &agentsv1alpha1.SandboxClaim{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-claim-no-tls",
+					Namespace: "default",
+					UID:       "test-uid-no-tls",
+				},
+				Spec: agentsv1alpha1.SandboxClaimSpec{
+					TemplateName: "test-template",
+				},
+			},
+			sandboxSet: &agentsv1alpha1.SandboxSet{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-template",
+					Namespace: "default",
+				},
+			},
+			runtimeTLSBundle: nil,
+			expectError:      false,
+			validate: func(t *testing.T, opts infra.ClaimSandboxOptions) {
+				assert.Nil(t, opts.RuntimeTLSBundle, "RuntimeTLSBundle should stay nil when the control is not configured for runtime TLS")
+			},
+		},
+		{
+			name: "non-empty reserved sandbox ID label is rejected",
+			claim: &agentsv1alpha1.SandboxClaim{
+				ObjectMeta: metav1.ObjectMeta{Name: "claim", Namespace: "default"},
+				Spec: agentsv1alpha1.SandboxClaimSpec{
+					TemplateName: "pool",
+					Labels:       map[string]string{agentsv1alpha1.LabelSandboxID: "injected-id"},
+				},
+			},
+			sandboxSet:          &agentsv1alpha1.SandboxSet{ObjectMeta: metav1.ObjectMeta{Name: "pool", Namespace: "default"}},
+			expectError:         true,
+			expectErrorContains: "is reserved and cannot be set by SandboxClaim",
+		},
+		{
+			name: "empty reserved sandbox ID label entry is rejected",
+			claim: &agentsv1alpha1.SandboxClaim{
+				ObjectMeta: metav1.ObjectMeta{Name: "claim", Namespace: "default"},
+				Spec: agentsv1alpha1.SandboxClaimSpec{
+					TemplateName: "pool",
+					Labels:       map[string]string{agentsv1alpha1.LabelSandboxID: ""},
+				},
+			},
+			sandboxSet:          &agentsv1alpha1.SandboxSet{ObjectMeta: metav1.ObjectMeta{Name: "pool", Namespace: "default"}},
+			expectError:         true,
+			expectErrorContains: "is reserved and cannot be set by SandboxClaim",
+		},
+		{
+			name: "non-empty reserved sandbox ID annotation is rejected",
+			claim: &agentsv1alpha1.SandboxClaim{
+				ObjectMeta: metav1.ObjectMeta{Name: "claim", Namespace: "default"},
+				Spec: agentsv1alpha1.SandboxClaimSpec{
+					TemplateName: "pool",
+					Annotations:  map[string]string{agentsv1alpha1.AnnotationSandboxID: "injected-id"},
+				},
+			},
+			sandboxSet:          &agentsv1alpha1.SandboxSet{ObjectMeta: metav1.ObjectMeta{Name: "pool", Namespace: "default"}},
+			expectError:         true,
+			expectErrorContains: "is reserved and cannot be set by SandboxClaim",
+		},
+		{
+			name: "empty reserved sandbox ID annotation entry is rejected",
+			claim: &agentsv1alpha1.SandboxClaim{
+				ObjectMeta: metav1.ObjectMeta{Name: "claim", Namespace: "default"},
+				Spec: agentsv1alpha1.SandboxClaimSpec{
+					TemplateName: "pool",
+					Annotations:  map[string]string{agentsv1alpha1.AnnotationSandboxID: ""},
+				},
+			},
+			sandboxSet:          &agentsv1alpha1.SandboxSet{ObjectMeta: metav1.ObjectMeta{Name: "pool", Namespace: "default"}},
+			expectError:         true,
+			expectErrorContains: "is reserved and cannot be set by SandboxClaim",
+		},
 	}
 
 	for _, tt := range tests {
@@ -1623,11 +1759,15 @@ func TestCommonControl_buildClaimOptions(t *testing.T) {
 			} else {
 				testClient = fakeClient
 			}
-			testControl := NewCommonControl(testClient, fakeRecorder, nil).(*commonControl)
+			testControl := NewCommonControl(testClient, fakeRecorder, nil, tt.runtimeTLSBundle).(*commonControl)
 			opts, err := testControl.buildClaimOptions(ctx, tt.claim, tt.sandboxSet)
 			if (err != nil) != tt.expectError {
 				t.Errorf("buildClaimOptions() error = %v, expectError %v", err, tt.expectError)
 				return
+			}
+			if tt.expectErrorContains != "" {
+				assert.Contains(t, err.Error(), tt.expectErrorContains)
+				assert.Nil(t, opts.Modifier)
 			}
 			if !tt.expectError && tt.validate != nil {
 				tt.validate(t, opts)
@@ -1701,7 +1841,7 @@ func TestBuildClaimOptions_CSIMount_ConfigValidation(t *testing.T) {
 	storageRegistry.RegisterProvider("nasplugin.csi.alibabacloud.com", &storages.MountProvider{})
 	storageRegistry.RegisterProvider("ossplugin.csi.alibabacloud.com", &storages.MountProvider{})
 
-	control := NewCommonControl(fakeClient, fakeRecorder, cache)
+	control := NewCommonControl(fakeClient, fakeRecorder, cache, nil)
 	// Inject the storage registry into the control
 	commonControl := control.(*commonControl)
 	commonControl.storageRegistry = storageRegistry
@@ -2125,7 +2265,7 @@ func TestBuildClaimOptions_CSIMount_Test(t *testing.T) {
 	storageRegistry.RegisterProvider("nasplugin.csi.alibabacloud.com", &storages.MountProvider{})
 	storageRegistry.RegisterProvider("ossplugin.csi.alibabacloud.com", &storages.MountProvider{})
 
-	control := NewCommonControl(fakeClient, fakeRecorder, cache)
+	control := NewCommonControl(fakeClient, fakeRecorder, cache, nil)
 	// Inject the storage registry into the control
 	commonControl := control.(*commonControl)
 	commonControl.storageRegistry = storageRegistry
@@ -2687,7 +2827,7 @@ func TestBuildClaimOptions_CSIMount_Test(t *testing.T) {
 						},
 					},
 				}
-				opts.Modifier(mockSandbox)
+				require.NoError(t, opts.Modifier(mockSandbox))
 				// Verify storage-auth annotation is set with correct JSON content
 				storageAuthVal := mockSandbox.GetAnnotations()["security.agents.kruise.io/storage-auth"]
 				assert.NotEmpty(t, storageAuthVal, "storage-auth annotation should be injected when credentialProviderName attribute is set")
@@ -2781,7 +2921,7 @@ func TestBuildClaimOptions_CSIMount_Test(t *testing.T) {
 						},
 					},
 				}
-				opts.Modifier(mockSandbox)
+				_ = opts.Modifier(mockSandbox)
 				// Verify storage-auth annotation is set with correct JSON content including kms-key-id
 				storageAuthVal := mockSandbox.GetAnnotations()["security.agents.kruise.io/storage-auth"]
 				assert.NotEmpty(t, storageAuthVal, "storage-auth annotation should be injected")
@@ -2839,7 +2979,7 @@ func TestBuildClaimOptions_CSIMount_Test(t *testing.T) {
 						},
 					},
 				}
-				opts.Modifier(mockSandbox)
+				require.NoError(t, opts.Modifier(mockSandbox))
 				// Verify storage-auth annotation is NOT set when credentialProviderName attribute is absent
 				annotations := mockSandbox.GetAnnotations()
 				_, exists := annotations["security.agents.kruise.io/storage-auth"]
