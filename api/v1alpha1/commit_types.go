@@ -58,6 +58,14 @@ type CommitSpec struct {
 	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="image is immutable"
 	Image string `json:"image"`
 
+	// BaseImage is an optional OCI image reference used as parent layers when
+	// rebasing a commit taken from a NYDUS (or other non-OCI-layer) runtime image.
+	// Prefer a digest-pinned ref, for example registry.example.com/repo@sha256:....
+	// When empty, commit-job may infer it from a delivery-<digest>-vN source tag.
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="baseImage is immutable"
+	BaseImage string `json:"baseImage,omitempty"`
+
 	// SquashLayer is the max number of writable layers to keep after squashing.
 	// 0 means no squashing. Reserved for future implementation.
 	// +kubebuilder:validation:Optional

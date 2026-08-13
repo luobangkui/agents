@@ -32,13 +32,20 @@ func main() {
 	klog.InitFlags(nil)
 	containerID := flag.String(jobutil.ArgContainerID, "", "Target container ID to commit.")
 	image := flag.String(jobutil.ArgImage, "", "Target image to commit and push.")
+	baseImage := flag.String(jobutil.ArgBaseImage, "", "Optional OCI base image for rebasing NYDUS commits.")
+	sourceImage := flag.String(jobutil.ArgSourceImage, "", "Running container image ref (used to infer baseImage from delivery tags).")
 	flag.Parse()
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer cancel()
 
 	klog.InfoS("Commit job starting")
-	exitCode := jobutil.DoCommit(ctx, jobutil.CommitOptions{ContainerID: *containerID, Image: *image})
+	exitCode := jobutil.DoCommit(ctx, jobutil.CommitOptions{
+		ContainerID: *containerID,
+		Image:       *image,
+		BaseImage:   *baseImage,
+		SourceImage: *sourceImage,
+	})
 
 	klog.InfoS("Commit job finished", "exitCode", exitCode)
 	klog.Flush()

@@ -35,6 +35,10 @@ const (
 	ArgContainerID = "container-id"
 	// ArgImage is the CLI argument name for the commit target image.
 	ArgImage = "image"
+	// ArgBaseImage is the optional OCI base image used to rebase NYDUS commits.
+	ArgBaseImage = "base-image"
+	// ArgSourceImage is the running container image reference (for delivery-tag inference).
+	ArgSourceImage = "source-image"
 
 	// EnvAgentJobImagePullPolicy is the environment variable name for the agent job image pull policy.
 	EnvAgentJobImagePullPolicy = "AGENT_JOB_IMAGE_PULL_POLICY"
