@@ -22,7 +22,8 @@ import (
 )
 
 // deliveryTagRe matches mid-lbg-image NYDUS delivery tags:
-//   <repository>:delivery-<sha256-hex>-v<N>
+//
+//	<repository>:delivery-<sha256-hex>-v<N>
 var deliveryTagRe = regexp.MustCompile(`^(.+):delivery-([a-f0-9]{64})-v[0-9]+$`)
 
 // InferOCIBaseImageFromDeliveryRef converts a NYDUS delivery image reference into
