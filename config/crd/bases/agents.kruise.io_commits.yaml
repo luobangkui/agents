@@ -52,16 +52,6 @@ spec:
             type: object
           spec:
             properties:
-              containerName:
-                type: string
-                x-kubernetes-validations:
-                - message: containerName is immutable
-                  rule: self == oldSelf
-              image:
-                type: string
-                x-kubernetes-validations:
-                - message: image is immutable
-                  rule: self == oldSelf
               baseImage:
                 description: |-
                   BaseImage is an optional OCI image reference used as parent layers when
@@ -71,6 +61,16 @@ spec:
                 type: string
                 x-kubernetes-validations:
                 - message: baseImage is immutable
+                  rule: self == oldSelf
+              containerName:
+                type: string
+                x-kubernetes-validations:
+                - message: containerName is immutable
+                  rule: self == oldSelf
+              image:
+                type: string
+                x-kubernetes-validations:
+                - message: image is immutable
                   rule: self == oldSelf
               podName:
                 type: string
