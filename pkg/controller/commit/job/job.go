@@ -18,6 +18,7 @@ package job
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	"k8s.io/klog/v2"
@@ -33,10 +34,14 @@ var defaultExecutor Executor = NerdctlExec
 type CommitOptions struct {
 	ContainerID string
 	Image       string
+	// BaseImage is an optional OCI parent used to rebase NYDUS commits before push.
+	BaseImage string
+	// SourceImage is the running container image ref; used to infer BaseImage.
+	SourceImage string
 }
 
 // DoCommit is the main entry point for the commit-job binary.
-// It performs: setup registry auth → nerdctl commit → nerdctl push.
+// It performs: setup registry auth → nerdctl commit → optional OCI rebase → nerdctl push.
 func DoCommit(ctx context.Context, opts CommitOptions) int {
 	return doCommitWith(ctx, opts, defaultExecutor)
 }
@@ -54,11 +59,23 @@ func doCommitWith(ctx context.Context, opts CommitOptions, executor Executor) in
 		return ExitCodeCommitFailed
 	}
 
-	klog.InfoS("Start commit", "containerID", containerID, "image", image)
+	klog.InfoS("Start commit", "containerID", containerID, "image", image,
+		"baseImage", opts.BaseImage, "sourceImage", opts.SourceImage)
 
 	// 1. Setup registry authentication
 	if err := setupRegistryAuth(); err != nil {
 		klog.ErrorS(err, "Failed to setup registry authentication, push may fail")
+	}
+
+	// Resolve source image early so NYDUS delivery-tag inference works even when
+	// an older sandbox-controller did not pass --source-image.
+	if strings.TrimSpace(opts.SourceImage) == "" {
+		if src, err := inspectContainerImage(ctx, containerID); err != nil {
+			klog.InfoS("Could not inspect container image for rebase inference", "err", err.Error())
+		} else {
+			opts.SourceImage = src
+			klog.InfoS("Inferred source image from container", "sourceImage", src)
+		}
 	}
 
 	// 2. nerdctl commit
@@ -69,7 +86,12 @@ func doCommitWith(ctx context.Context, opts CommitOptions, executor Executor) in
 	}
 	klog.InfoS("Commit succeeded", "elapsed", time.Since(start))
 
-	// 3. nerdctl push
+	// 3. Optional rebase onto OCI base (required when commit kept NYDUS parents)
+	if code := maybeRebaseBeforePush(ctx, opts, executor); code != ExitCodeSuccess {
+		return code
+	}
+
+	// 4. nerdctl push
 	klog.InfoS("Start to push image", "image", image)
 	start = time.Now()
 	if err := executor(ctx, WithArgs("push", image)); err != nil {
@@ -78,5 +100,40 @@ func doCommitWith(ctx context.Context, opts CommitOptions, executor Executor) in
 	}
 	klog.InfoS("Push succeeded", "elapsed", time.Since(start))
 
+	return ExitCodeSuccess
+}
+
+func maybeRebaseBeforePush(ctx context.Context, opts CommitOptions, executor Executor) int {
+	needs, err := ImageHasNydusLayers(ctx, opts.Image)
+	if err != nil {
+		// Helper missing or inspect failed: only hard-fail when a base was requested.
+		if ResolveBaseImage(opts.BaseImage, opts.SourceImage) == "" {
+			klog.InfoS("Skip rebase check", "err", err.Error())
+			return ExitCodeSuccess
+		}
+		klog.ErrorS(err, "Failed to inspect committed image for nydus layers")
+		return ExitCodeCommitFailed
+	}
+	if !needs {
+		klog.InfoS("Committed image has no nydus layers; skip rebase")
+		return ExitCodeSuccess
+	}
+
+	base := ResolveBaseImage(opts.BaseImage, opts.SourceImage)
+	if base == "" {
+		klog.ErrorS(nil, "Committed image has nydus layers but no OCI baseImage/source delivery tag was provided")
+		return ExitCodeCommitFailed
+	}
+
+	klog.InfoS("Pull OCI base for rebase", "base", base)
+	if err := executor(ctx, WithArgs("pull", base)); err != nil {
+		klog.ErrorS(err, "Pull base image failed", "base", base)
+		return ExitCodeCommitFailed
+	}
+	klog.InfoS("Rebase committed image onto OCI base", "image", opts.Image, "base", base)
+	if err := RebaseImageOntoBase(ctx, opts.Image, base); err != nil {
+		klog.ErrorS(err, "Rebase failed", "image", opts.Image, "base", base)
+		return ExitCodeCommitFailed
+	}
 	return ExitCodeSuccess
 }

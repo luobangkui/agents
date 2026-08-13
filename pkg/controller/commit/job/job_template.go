@@ -65,10 +65,34 @@ func (g *JobGenerator) commitLabels() map[string]string {
 }
 
 func (g *JobGenerator) commitArgs() []string {
-	return []string{
+	args := []string{
 		fmt.Sprintf("--%s=%s", ArgContainerID, g.commitContainerID()),
 		fmt.Sprintf("--%s=%s", ArgImage, g.Commit.Spec.Image),
 	}
+	if base := strings.TrimSpace(g.Commit.Spec.BaseImage); base != "" {
+		args = append(args, fmt.Sprintf("--%s=%s", ArgBaseImage, base))
+	}
+	if src := g.sourceImageRef(); src != "" {
+		args = append(args, fmt.Sprintf("--%s=%s", ArgSourceImage, src))
+	}
+	return args
+}
+
+// sourceImageRef prefers the pod template image (usually the delivery tag),
+// then falls back to container status image.
+func (g *JobGenerator) sourceImageRef() string {
+	name := g.Commit.Spec.ContainerName
+	for _, c := range g.Pod.Spec.Containers {
+		if c.Name == name && strings.TrimSpace(c.Image) != "" {
+			return strings.TrimSpace(c.Image)
+		}
+	}
+	for _, status := range g.Pod.Status.ContainerStatuses {
+		if status.Name == name && strings.TrimSpace(status.Image) != "" {
+			return strings.TrimSpace(status.Image)
+		}
+	}
+	return ""
 }
 
 func (g *JobGenerator) volumes() ([]corev1.Volume, []corev1.VolumeMount) {

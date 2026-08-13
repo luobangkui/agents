@@ -52,6 +52,16 @@ spec:
             type: object
           spec:
             properties:
+              baseImage:
+                description: |-
+                  BaseImage is an optional OCI image reference used as parent layers when
+                  rebasing a commit taken from a NYDUS (or other non-OCI-layer) runtime image.
+                  Prefer a digest-pinned ref, for example registry.example.com/repo@sha256:....
+                  When empty, commit-job may infer it from a delivery-<digest>-vN source tag.
+                type: string
+                x-kubernetes-validations:
+                - message: baseImage is immutable
+                  rule: self == oldSelf
               containerName:
                 type: string
                 x-kubernetes-validations:
