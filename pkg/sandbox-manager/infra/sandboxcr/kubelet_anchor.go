@@ -62,6 +62,8 @@ const (
 	kubeletPodsRoot              = "/var/lib/kubelet/pods"
 	anchorSourcePath             = "/source"
 	anchorTargetRoot             = "/target"
+	sandboxMountRootName         = "mount-root"
+	sandboxMountRootPath         = "/run/csi/mount-root"
 )
 
 func candidateSupportsStagedMounts(
@@ -72,6 +74,19 @@ func candidateSupportsStagedMounts(
 ) error {
 	if opts == nil || len(opts.StagedMountOptionList) == 0 {
 		return nil
+	}
+	if sbx.Status.PodInfo.PodUID == "" {
+		return fmt.Errorf("sandbox has no pod UID")
+	}
+	pod := &corev1.Pod{}
+	if err := reader.Get(ctx, client.ObjectKey{Namespace: sbx.Namespace, Name: sbx.Name}, pod); err != nil {
+		return fmt.Errorf("get sandbox pod %s/%s: %w", sbx.Namespace, sbx.Name, err)
+	}
+	if pod.UID != sbx.Status.PodInfo.PodUID {
+		return fmt.Errorf("sandbox pod UID changed from %s to %s", sbx.Status.PodInfo.PodUID, pod.UID)
+	}
+	if err := validateSandboxMountPropagation(pod); err != nil {
+		return err
 	}
 	nodeName := strings.TrimSpace(sbx.Status.PodInfo.NodeName)
 	if nodeName == "" {
@@ -97,6 +112,30 @@ func candidateSupportsStagedMounts(
 		}
 	}
 	return nil
+}
+
+func validateSandboxMountPropagation(pod *corev1.Pod) error {
+	hasVolume := false
+	for _, volume := range pod.Spec.Volumes {
+		if volume.Name == sandboxMountRootName && volume.EmptyDir != nil {
+			hasVolume = true
+			break
+		}
+	}
+	if !hasVolume {
+		return fmt.Errorf("sandbox pod %s/%s has no %s emptyDir", pod.Namespace, pod.Name, sandboxMountRootName)
+	}
+	if len(pod.Spec.Containers) == 0 {
+		return fmt.Errorf("sandbox pod %s/%s has no business container", pod.Namespace, pod.Name)
+	}
+	for _, mount := range pod.Spec.Containers[0].VolumeMounts {
+		if mount.Name == sandboxMountRootName && mount.MountPath == sandboxMountRootPath &&
+			mount.MountPropagation != nil && *mount.MountPropagation == corev1.MountPropagationHostToContainer {
+			return nil
+		}
+	}
+	return fmt.Errorf("sandbox pod %s/%s business container lacks %s HostToContainer mount at %s",
+		pod.Namespace, pod.Name, sandboxMountRootName, sandboxMountRootPath)
 }
 
 func csiNodeHasDriver(csiNode *storagev1.CSINode, driver string) bool {

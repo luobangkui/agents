@@ -43,11 +43,24 @@ func TestCandidateSupportsStagedMounts(t *testing.T) {
 	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-a", Labels: map[string]string{
 		storages.VEPFSMountServiceDomainKey: "mount-aed6284f",
 	}}}
+	propagation := corev1.MountPropagationHostToContainer
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "sandbox-a", UID: types.UID("pod-uid")},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{Name: "main", VolumeMounts: []corev1.VolumeMount{{
+				Name: sandboxMountRootName, MountPath: sandboxMountRootPath, MountPropagation: &propagation,
+			}}}},
+			Volumes: []corev1.Volume{{Name: sandboxMountRootName, VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}}},
+		},
+	}
 	csiNode := &storagev1.CSINode{ObjectMeta: metav1.ObjectMeta{Name: "node-a"}, Spec: storagev1.CSINodeSpec{
 		Drivers: []storagev1.CSINodeDriver{{Name: storages.VEPFSCSIDriverName, NodeID: "node-a"}},
 	}}
-	reader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(node, csiNode).Build()
-	sbx := &agentsv1alpha1.Sandbox{Status: agentsv1alpha1.SandboxStatus{PodInfo: agentsv1alpha1.PodInfo{NodeName: "node-a"}}}
+	reader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(node, csiNode, pod).Build()
+	sbx := &agentsv1alpha1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "sandbox-a"},
+		Status:     agentsv1alpha1.SandboxStatus{PodInfo: agentsv1alpha1.PodInfo{NodeName: "node-a", PodUID: pod.UID}},
+	}
 	opts := &runtimeconfig.CSIMountOptions{StagedMountOptionList: []runtimeconfig.StagedMountConfig{{Plan: storages.MountPlan{
 		Placement: storages.PlacementRequirement{
 			CSIDriver: storages.VEPFSCSIDriverName, DomainKey: storages.VEPFSMountServiceDomainKey, DomainValue: "mount-aed6284f",
@@ -55,6 +68,11 @@ func TestCandidateSupportsStagedMounts(t *testing.T) {
 	}}}}
 
 	require.NoError(t, candidateSupportsStagedMounts(context.Background(), reader, sbx, opts))
+	pod.Spec.Containers[0].VolumeMounts[0].MountPropagation = nil
+	require.NoError(t, reader.Update(context.Background(), pod))
+	require.ErrorContains(t, candidateSupportsStagedMounts(context.Background(), reader, sbx, opts), "lacks mount-root HostToContainer")
+	pod.Spec.Containers[0].VolumeMounts[0].MountPropagation = &propagation
+	require.NoError(t, reader.Update(context.Background(), pod))
 	node.Labels[storages.VEPFSMountServiceDomainKey] = "other-domain"
 	require.NoError(t, reader.Update(context.Background(), node))
 	require.ErrorContains(t, candidateSupportsStagedMounts(context.Background(), reader, sbx, opts), "requires")
