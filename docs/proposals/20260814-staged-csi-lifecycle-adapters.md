@@ -13,6 +13,8 @@ see-also:
 
 # Staged CSI Lifecycle Adapters for Dynamic Sandbox Mounts
 
+Companion explainer: [VEPFS dynamic mount principles, operation flow, and cluster evidence](../vepfs-dynamic-mount-explainer.html).
+
 ## Summary
 
 The current dynamic CSI implementation assumes that a running Sandbox can call
