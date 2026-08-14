@@ -83,6 +83,10 @@ func (p *VEPFSMountProvider) GenerateStagedCSIMountPlan(
 	if persistentVolumeObj.UID == "" {
 		return nil, fmt.Errorf("VEPFS persistent volume UID is required")
 	}
+	claimRef := persistentVolumeObj.Spec.ClaimRef
+	if claimRef == nil || strings.TrimSpace(claimRef.Namespace) == "" || strings.TrimSpace(claimRef.Name) == "" {
+		return nil, fmt.Errorf("VEPFS persistent volume must be bound to a namespaced persistent volume claim")
+	}
 	if strings.TrimSpace(input.TargetPath) == "" {
 		return nil, fmt.Errorf("VEPFS target path is required")
 	}
@@ -108,12 +112,15 @@ func (p *VEPFSMountProvider) GenerateStagedCSIMountPlan(
 		Strategy:       MountStrategyKubeletAnchor,
 		VolumeIdentity: identity,
 		Anchor: &KubeletAnchorSpec{
-			PersistentVolumeName: persistentVolumeObj.Name,
-			PersistentVolumeUID:  persistentVolumeObj.UID,
-			VolumeHandle:         volumeHandle,
-			SubPath:              cleanSubPath,
-			TargetPath:           input.TargetPath,
-			ReadOnly:             effectiveReadOnly,
+			PersistentVolumeName:           persistentVolumeObj.Name,
+			PersistentVolumeUID:            persistentVolumeObj.UID,
+			PersistentVolumeClaimNamespace: claimRef.Namespace,
+			PersistentVolumeClaimName:      claimRef.Name,
+			PersistentVolumeClaimUID:       claimRef.UID,
+			VolumeHandle:                   volumeHandle,
+			SubPath:                        cleanSubPath,
+			TargetPath:                     input.TargetPath,
+			ReadOnly:                       effectiveReadOnly,
 		},
 		Placement: PlacementRequirement{
 			CSIDriver:   VEPFSCSIDriverName,

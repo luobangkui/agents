@@ -1,0 +1,213 @@
+/*
+Copyright 2026.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package sandboxcr
+
+import (
+	"context"
+	"strings"
+	"testing"
+
+	"github.com/stretchr/testify/require"
+	corev1 "k8s.io/api/core/v1"
+	storagev1 "k8s.io/api/storage/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+
+	agentsv1alpha1 "github.com/openkruise/agents/api/v1alpha1"
+	"github.com/openkruise/agents/pkg/agent-runtime/storages"
+	runtimeconfig "github.com/openkruise/agents/pkg/utils/runtime/config"
+)
+
+func TestCandidateSupportsStagedMounts(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, corev1.AddToScheme(scheme))
+	require.NoError(t, storagev1.AddToScheme(scheme))
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-a", Labels: map[string]string{
+		storages.VEPFSMountServiceDomainKey: "mount-aed6284f",
+	}}}
+	csiNode := &storagev1.CSINode{ObjectMeta: metav1.ObjectMeta{Name: "node-a"}, Spec: storagev1.CSINodeSpec{
+		Drivers: []storagev1.CSINodeDriver{{Name: storages.VEPFSCSIDriverName, NodeID: "node-a"}},
+	}}
+	reader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(node, csiNode).Build()
+	sbx := &agentsv1alpha1.Sandbox{Status: agentsv1alpha1.SandboxStatus{PodInfo: agentsv1alpha1.PodInfo{NodeName: "node-a"}}}
+	opts := &runtimeconfig.CSIMountOptions{StagedMountOptionList: []runtimeconfig.StagedMountConfig{{Plan: storages.MountPlan{
+		Placement: storages.PlacementRequirement{
+			CSIDriver: storages.VEPFSCSIDriverName, DomainKey: storages.VEPFSMountServiceDomainKey, DomainValue: "mount-aed6284f",
+		},
+	}}}}
+
+	require.NoError(t, candidateSupportsStagedMounts(context.Background(), reader, sbx, opts))
+	node.Labels[storages.VEPFSMountServiceDomainKey] = "other-domain"
+	require.NoError(t, reader.Update(context.Background(), node))
+	require.ErrorContains(t, candidateSupportsStagedMounts(context.Background(), reader, sbx, opts), "requires")
+}
+
+func TestApplyStagedPlacementToNewSandbox(t *testing.T) {
+	newSandbox := func() *agentsv1alpha1.Sandbox {
+		return &agentsv1alpha1.Sandbox{Spec: agentsv1alpha1.SandboxSpec{
+			EmbeddedSandboxTemplate: agentsv1alpha1.EmbeddedSandboxTemplate{
+				TemplateRef: &agentsv1alpha1.SandboxTemplateRef{Name: "resolved-template"},
+				Template: &corev1.PodTemplateSpec{Spec: corev1.PodSpec{
+					NodeSelector: map[string]string{"existing": "value"},
+				}},
+			},
+		}}
+	}
+	options := func(key, value string) *runtimeconfig.CSIMountOptions {
+		return &runtimeconfig.CSIMountOptions{StagedMountOptionList: []runtimeconfig.StagedMountConfig{{Plan: storages.MountPlan{
+			Driver: "vepfs.csi.volcengine.com",
+			Placement: storages.PlacementRequirement{
+				DomainKey: key, DomainValue: value,
+			},
+		}}}}
+	}
+
+	t.Run("materializes template and adds selector", func(t *testing.T) {
+		sbx := newSandbox()
+		err := applyStagedPlacementToNewSandbox(sbx, options("vepfs.csi.volcengine.com/mount-service", "mount-aed6284f"))
+		require.NoError(t, err)
+		require.Nil(t, sbx.Spec.TemplateRef)
+		require.Equal(t, "value", sbx.Spec.Template.Spec.NodeSelector["existing"])
+		require.Equal(t, "mount-aed6284f", sbx.Spec.Template.Spec.NodeSelector["vepfs.csi.volcengine.com/mount-service"])
+	})
+
+	t.Run("rejects existing selector conflict", func(t *testing.T) {
+		sbx := newSandbox()
+		sbx.Spec.Template.Spec.NodeSelector["vepfs.csi.volcengine.com/mount-service"] = "mount-other"
+		err := applyStagedPlacementToNewSandbox(sbx, options("vepfs.csi.volcengine.com/mount-service", "mount-aed6284f"))
+		require.ErrorContains(t, err, "conflicts with node selector")
+	})
+
+	t.Run("rejects different domains in one claim", func(t *testing.T) {
+		sbx := newSandbox()
+		opts := options("vepfs.csi.volcengine.com/mount-service", "mount-aed6284f")
+		opts.StagedMountOptionList = append(opts.StagedMountOptionList, runtimeconfig.StagedMountConfig{Plan: storages.MountPlan{
+			Driver: "vepfs.csi.volcengine.com",
+			Placement: storages.PlacementRequirement{
+				DomainKey: "vepfs.csi.volcengine.com/mount-service", DomainValue: "mount-other",
+			},
+		}})
+		err := applyStagedPlacementToNewSandbox(sbx, opts)
+		require.ErrorContains(t, err, "conflicts with node selector")
+	})
+
+	t.Run("requires resolved template", func(t *testing.T) {
+		sbx := &agentsv1alpha1.Sandbox{}
+		err := applyStagedPlacementToNewSandbox(sbx, options("vepfs.csi.volcengine.com/mount-service", "mount-aed6284f"))
+		require.ErrorContains(t, err, "resolved pod template is required")
+	})
+}
+
+func TestReconcileKubeletAnchorsReapsStalePodIncarnation(t *testing.T) {
+	infraInstance, kubeClient := NewTestInfra(t)
+	defer infraInstance.Stop(t.Context())
+
+	sbx := &agentsv1alpha1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      "claimed-sandbox",
+			UID:       types.UID("sandbox-uid"),
+			Labels:    map[string]string{agentsv1alpha1.LabelSandboxIsClaimed: agentsv1alpha1.True},
+		},
+		Status: agentsv1alpha1.SandboxStatus{PodInfo: agentsv1alpha1.PodInfo{PodUID: types.UID("new-pod-uid")}},
+	}
+	require.NoError(t, kubeClient.Create(t.Context(), sbx))
+
+	anchor := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:  "default",
+			Name:       "csi-anchor-stale",
+			Finalizers: []string{KubeletAnchorFinalizer},
+			Labels: map[string]string{
+				KubeletAnchorManagedLabel:     "true",
+				KubeletAnchorSandboxNameLabel: sbx.Name,
+				KubeletAnchorSandboxNSLabel:   sbx.Namespace,
+			},
+			Annotations: map[string]string{
+				KubeletAnchorSandboxUIDAnno:    string(sbx.UID),
+				KubeletAnchorSandboxPodUIDAnno: "old-pod-uid",
+			},
+		},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: KubeletAnchorContainerName, Image: "anchor:test"}}},
+	}
+	require.NoError(t, kubeClient.Create(t.Context(), anchor))
+	anchor.Status.ContainerStatuses = []corev1.ContainerStatus{{
+		Name: KubeletAnchorContainerName,
+		State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+			ExitCode: 0,
+		}},
+	}}
+	require.NoError(t, kubeClient.Status().Update(t.Context(), anchor))
+
+	require.NoError(t, infraInstance.reconcileKubeletAnchors(t.Context()))
+	err := kubeClient.Get(t.Context(), client.ObjectKeyFromObject(anchor), &corev1.Pod{})
+	require.True(t, apierrors.IsNotFound(err), "stale anchor should be deleted, got %v", err)
+}
+
+func TestBuildKubeletAnchorPod(t *testing.T) {
+	t.Setenv(KubeletAnchorImageEnv, "registry.example/anchor:test")
+	t.Setenv(KubeletAnchorPullSecretEnv, "registry-secret")
+	scheme := runtime.NewScheme()
+	require.NoError(t, corev1.AddToScheme(scheme))
+	pvc := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "storage", Name: "vepfs-pvc", UID: types.UID("pvc-uid")},
+		Spec:       corev1.PersistentVolumeClaimSpec{VolumeName: "vepfs-pv"},
+	}
+	kubeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pvc).Build()
+	sbx := &agentsv1alpha1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "sandbox", Name: "warm-sandbox", UID: types.UID("sandbox-uid")},
+		Status: agentsv1alpha1.SandboxStatus{PodInfo: agentsv1alpha1.PodInfo{
+			NodeName: "node-a", PodUID: types.UID("sandbox-pod-uid"),
+		}},
+	}
+	identity := strings.Repeat("a", 64)
+	plan := &storages.MountPlan{
+		Strategy:       storages.MountStrategyKubeletAnchor,
+		VolumeIdentity: identity,
+		Anchor: &storages.KubeletAnchorSpec{
+			PersistentVolumeName:           "vepfs-pv",
+			PersistentVolumeClaimNamespace: "storage",
+			PersistentVolumeClaimName:      "vepfs-pvc",
+			PersistentVolumeClaimUID:       types.UID("pvc-uid"),
+			SubPath:                        "users/42",
+			TargetPath:                     "/workspace/data",
+		},
+	}
+
+	pod, err := buildKubeletAnchorPod(context.Background(), kubeClient, sbx, plan)
+	require.NoError(t, err)
+	require.Equal(t, "storage", pod.Namespace)
+	require.Equal(t, "node-a", pod.Spec.NodeName)
+	require.Contains(t, pod.Finalizers, KubeletAnchorFinalizer)
+	require.Equal(t, "registry.example/anchor:test", pod.Spec.Containers[0].Image)
+	require.Equal(t, "users/42", pod.Spec.Containers[0].VolumeMounts[0].SubPath)
+	require.Equal(t, corev1.MountPropagationBidirectional, *pod.Spec.Containers[0].VolumeMounts[1].MountPropagation)
+	require.Equal(t,
+		"/var/lib/kubelet/pods/sandbox-pod-uid/volumes/kubernetes.io~empty-dir/mount-root",
+		pod.Spec.Volumes[1].HostPath.Path)
+	require.Equal(t, "registry-secret", pod.Spec.ImagePullSecrets[0].Name)
+
+	otherSandbox := sbx.DeepCopy()
+	otherSandbox.UID = types.UID("other-sandbox-uid")
+	otherPod, err := buildKubeletAnchorPod(context.Background(), kubeClient, otherSandbox, plan)
+	require.NoError(t, err)
+	require.NotEqual(t, pod.Name, otherPod.Name, "concurrent sandboxes sharing an RWX volume need distinct anchor pods")
+}

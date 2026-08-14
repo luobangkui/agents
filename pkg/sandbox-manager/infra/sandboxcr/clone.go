@@ -238,7 +238,7 @@ func CloneSandbox(ctx context.Context, opts infra.CloneSandboxOptions, cache inf
 	}
 	if opts.CSIMount != nil {
 		log.Info("starting to perform csi mount")
-		metrics.CSIMount, err = traceCSIMounts(ctx, sbx.Sandbox, *opts.CSIMount, rtOpts...)
+		metrics.CSIMount, err = traceCSIMounts(ctx, sbx.Cache.GetClient(), sbx.Cache.GetAPIReader(), sbx.Sandbox, *opts.CSIMount, rtOpts...)
 		metrics.Total += metrics.CSIMount
 		if err != nil {
 			log.Error(err, "failed to perform csi mount")

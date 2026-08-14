@@ -163,6 +163,41 @@ func csiUnmount(
 	return nil
 }
 
+// ExposeKubeletAnchor creates the user-visible symlink after a same-node
+// kubelet anchor has propagated its bind mount into the sandbox mount-root.
+func ExposeKubeletAnchor(ctx context.Context, sbx *agentsv1alpha1.Sandbox, identity, mountPath string) error {
+	return changeKubeletAnchorExposure(ctx, sbx, "expose", identity, mountPath)
+}
+
+// UnexposeKubeletAnchor removes only the symlink owned by identity. The anchor
+// mounter must already have unmounted the propagated bind before this is called.
+func UnexposeKubeletAnchor(ctx context.Context, sbx *agentsv1alpha1.Sandbox, identity, mountPath string) error {
+	return changeKubeletAnchorExposure(ctx, sbx, "unexpose", identity, mountPath)
+}
+
+func changeKubeletAnchorExposure(ctx context.Context, sbx *agentsv1alpha1.Sandbox, operation, identity, mountPath string) error {
+	result, err := RunCommandWithRuntime(ctx, RunCmdFuncArgs{
+		Sbx: sbx,
+		ProcessConfig: &process.ProcessConfig{
+			Cmd: MountCommand,
+			Args: []string{
+				operation,
+				"--identity", identity,
+				"--mount-path", mountPath,
+			},
+		},
+		Timeout:  csiMountTimeout,
+		AuthUser: "root",
+	})
+	if err != nil {
+		return fmt.Errorf("failed to %s kubelet anchor: %w (stderr: %s)", operation, err, result.Stderr)
+	}
+	if result.ExitCode != 0 {
+		return fmt.Errorf("failed to %s kubelet anchor: exit code %d: %s", operation, result.ExitCode, result.Stderr)
+	}
+	return nil
+}
+
 // ProcessCSIMounts performs CSI volume mounting operations for all mount configurations concurrently.
 // It uses opts.Concurrency to limit the number of concurrent mount goroutines.
 // If Concurrency is 0 or negative, it defaults to config.DefaultCSIMountConcurrency.
@@ -391,14 +426,16 @@ func ResolveCSIMountFromAnnotation(ctx context.Context, obj metav1.Object, clien
 		return nil, nil
 	}
 	csiClient := csimountutils.NewCSIMountHandler(cache.GetClient(), cache.GetAPIReader(), storageRegistry, utils.DefaultSandboxDeployNamespace)
-	mountOptionList := make([]config.MountConfig, 0, len(csiMountConfigs))
+	opts := &config.CSIMountOptions{}
 	for _, cfg := range csiMountConfigs {
-		driverName, publishRequest, genErr := csiClient.GenerateNodePublishVolumeRequest(ctx, cfg)
+		plan, genErr := csiClient.GenerateMountPlan(ctx, cfg)
 		if genErr != nil {
 			log.Error(genErr, "failed to generate csi mount options config", "mountConfig", cfg)
 			return nil, fmt.Errorf("failed to generate csi mount options config: %w", genErr)
 		}
-		mountOptionList = append(mountOptionList, config.MountConfig{Driver: driverName, PublishRequest: publishRequest})
+		if genErr = opts.AppendMountPlan(plan); genErr != nil {
+			return nil, genErr
+		}
 	}
-	return &config.CSIMountOptions{MountOptionList: mountOptionList}, nil
+	return opts, nil
 }

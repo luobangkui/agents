@@ -449,23 +449,18 @@ func (c *commonControl) applyInitRuntimeOptions(ctx context.Context, opts *infra
 // metadata from the given mount configurations.
 func (c *commonControl) buildCSIMountOptions(ctx context.Context, mounts []agentsv1alpha1.CSIMountConfig) (*config.CSIMountOptions, string, string, error) {
 	logger := logf.FromContext(ctx)
-	csiMountOptions := make([]config.MountConfig, 0, len(mounts))
+	opts := &config.CSIMountOptions{}
 	csiClient := csiutils.NewCSIMountHandler(c.cache.GetClient(), c.cache.GetAPIReader(), c.storageRegistry, utils.DefaultSandboxDeployNamespace)
 	for _, mountConfig := range mounts {
-		driverName, publishRequest, genErr := csiClient.GenerateNodePublishVolumeRequest(ctx, mountConfig)
+		plan, genErr := csiClient.GenerateMountPlan(ctx, mountConfig)
 		if genErr != nil {
 			errMsg := "failed to generate csi mount options config for sandbox"
 			logger.Error(genErr, errMsg, "mountConfigRequest", mountConfig)
 			return nil, "", "", fmt.Errorf("%s, err: %v", errMsg, genErr)
 		}
-		csiMountOptions = append(csiMountOptions, config.MountConfig{
-			Driver:         driverName,
-			PublishRequest: publishRequest,
-		})
-	}
-
-	opts := &config.CSIMountOptions{
-		MountOptionList: csiMountOptions,
+		if genErr = opts.AppendMountPlan(plan); genErr != nil {
+			return nil, "", "", genErr
+		}
 	}
 
 	// json marshal csi mount config to raw string

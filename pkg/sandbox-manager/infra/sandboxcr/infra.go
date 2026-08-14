@@ -112,7 +112,11 @@ type Infra struct {
 }
 
 func (i *Infra) Run(ctx context.Context) error {
-	return i.Cache.Run(ctx)
+	if err := i.Cache.Run(ctx); err != nil {
+		return err
+	}
+	go i.runKubeletAnchorReconciler(ctx)
+	return nil
 }
 
 func (i *Infra) Stop(ctx context.Context) {

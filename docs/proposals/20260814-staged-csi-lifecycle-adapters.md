@@ -25,9 +25,10 @@ single mount-service domain.
 
 This proposal adds a capability-based CSI lifecycle adapter layer. Direct-publish drivers retain
 the existing wire contract and execution path. Staged drivers use a Kubernetes-managed anchor
-volume on the selected node, followed by a privileged node mounter that bind-mounts the
-kubelet-published anchor target into the already-running Sandbox mount namespace with bidirectional
-mount propagation. Unmount reverses that order and releases the anchor only after the last consumer.
+volume on the selected node, followed by a privileged node mounter whose target mount is
+`Bidirectional`. The already-running, non-privileged Sandbox receives those host mount events through
+a `HostToContainer` mount-root. Each `Sandbox UID + VolumeIdentity` owns a distinct Anchor Pod;
+unmount reverses that order and releases only that Sandbox's anchor.
 
 VEPFS is the first staged adapter. The abstraction is intentionally based on lifecycle and placement
 capabilities rather than cloud names so that Volcano Engine EFS/FSx, Tencent storage, and other CSI
@@ -57,9 +58,13 @@ The following observations were reproduced on the Volcano Engine test cluster on
    `mount-3dccb7d6` with an error stating that the node had already joined a different domain.
 6. A positive experiment proved the desired pre-warm behavior: after a business Pod was already
    running, a same-node Kubernetes anchor caused kubelet to Attach/Stage/Publish VEPFS; a privileged
-   mounter then bind-mounted the host-visible kubelet target into a bidirectionally propagated
-   `emptyDir`. The original business Pod read and wrote VEPFS without restarting. Reversing the bind
-   mount removed it without restarting the Pod.
+   mounter then bind-mounted the host-visible kubelet target into the shared `emptyDir`. The
+   privileged mounter side was `Bidirectional`; the non-privileged business container side was
+   `HostToContainer`. The original business Pod read and wrote VEPFS without restarting. Reversing
+   the bind mount removed it without restarting the Pod.
+7. A server-side dry-run proved that Kubernetes rejects `Bidirectional` on the existing
+   non-privileged Sandbox business container. The business container does not need that direction:
+   it only needs host-to-container mount and unmount events.
 
 These observations close the causal chain:
 
@@ -69,7 +74,7 @@ VEPFS NodePublish reads stage metadata
   -> direct call fails regardless of provider field mapping
   -> Kubernetes anchor supplies Attach + Stage + Publish
   -> same-node privileged bind supplies the mount to the running warm Sandbox
-  -> bidirectional propagation makes it visible in the Sandbox mount namespace
+  -> mounter Bidirectional + Sandbox HostToContainer propagation makes it visible in the Sandbox
 ```
 
 ### Goals
@@ -136,8 +141,8 @@ type LifecycleAdapter interface {
 
 Execution is owned by one lifecycle service with three operations: `Mount`, `Unmount`, and
 `Reconcile`. Callers do not know whether the resulting plan uses a direct CSI RPC or an anchor.
-The service delegates staged data-plane operations through a `NodeMounter` port implemented by the
-privileged node component.
+For the staged strategy, sandbox-manager creates a privileged Anchor Pod pinned to the Sandbox
+node. The mounter runs inside that Pod; there is no remotely reachable privileged mount API.
 
 This split avoids two leaky abstractions:
 
@@ -182,11 +187,14 @@ sequenceDiagram
     K->>C: NodeUnpublish + NodeUnstage + ControllerUnpublish
 ```
 
-The anchor is an agent-owned Kubernetes workload pinned to the same node as the Sandbox. Its Pod
+The anchor is an agent-owned Kubernetes Pod pinned to the same node as the Sandbox. Its Pod
 spec contains the real PV reference, so kubelet and external CSI components remain responsible for
 all attach, stage, publish, secret, and recovery behavior. The anchor's published kubelet path must
 be host-visible to the node mounter. The node mounter performs only a bind/unbind into an allowlisted
-Sandbox mount-root with `Bidirectional` propagation.
+Sandbox mount-root. The privileged mounter uses `Bidirectional`; the unprivileged Sandbox uses
+`HostToContainer`. The Anchor Pod is also the persisted operation record: labels and annotations
+carry the Sandbox UID, Sandbox Pod UID, volume identity, PV and target path, while a finalizer keeps
+the Pod observable until the mounter reports a successful unmount.
 
 ### VEPFS adapter
 
@@ -208,67 +216,62 @@ can be reserved for it.
 
 ### Domain-aware placement
 
-The Claim path must filter warm candidates before taking the Claim lock:
+The Claim path filters warm candidates before taking the Claim lock:
 
 1. Remove nodes without a matching `CSINode` driver registration.
-2. Prefer nodes already assigned to the requested domain.
-3. Otherwise reserve an unassigned compatible node atomically for that domain.
-4. Never place a different domain on an assigned node.
-5. If no warm Sandbox is compatible, return a typed capacity/placement failure or take the existing
-   cold-start fallback; do not claim an incompatible Sandbox and fail later during mount.
+2. Require the node's operator-managed domain label to equal the PV's `mountServiceID`.
+3. Never claim a warm Sandbox on a different or unlabelled domain.
+4. For the cold-create fallback, materialize the resolved SandboxTemplate and inject the same domain
+   label as a `nodeSelector`; reject an existing conflicting selector before creating anything.
+5. If no warm Sandbox is compatible, return the existing no-capacity result or take the constrained
+   cold-start fallback.
 
-The assignment is recorded in an agent-owned node-scoped lease/resource, not inferred solely from
-currently running anchors. A mount-service may leave persistent node state after the last Pod, so
-deleting the anchor is not evidence that the node is immediately reusable by another domain. The
-lease is released only after a driver-defined cleanup or explicit node recycling policy confirms
-that reuse is safe.
+The current rollout deliberately does not reassign node domains dynamically. Operations labels only
+nodes whose live VEPFS client and current boot ID prove they already belong to that mount service.
+This matches the test environment's one-to-one mountServiceID policy and avoids treating Anchor
+deletion as evidence that vendor node-global state is clean. Dynamic domain assignment would need a
+separate node lease plus a vendor-supported leave/reset operation.
 
 ### Identity, ownership, and concurrency
 
 `VolumeIdentity` is stable across retries and is derived from driver, PV UID/volume handle,
 sub-path, read-only flag, and the Sandbox mount target. It must not contain a random suffix.
 
-The control plane stores an agent-owned mount record with these states:
+`VolumeIdentity` identifies the sandbox-local target, while the Anchor Pod name hashes
+`Sandbox UID + VolumeIdentity`. This prevents two Sandboxes concurrently using the same RWX PV from
+colliding and still gives retries for one Sandbox the same object.
 
-```text
-Pending -> Anchoring -> Ready -> Binding -> Mounted
-   |          |                    |          |
-   +----------+------> Failed <----+----------+
-Mounted -> Unbinding -> Releasing -> Released
-```
-
-Each transition is idempotent. At most one operation for a `VolumeIdentity + Sandbox UID` executes
-at a time. An anchor is reference-counted by node and physical volume identity; it is deleted only
-when its last consumer has successfully unbound. Reconciliation handles abandoned `Binding`,
-`Unbinding`, and `Releasing` states after controller restarts.
+Create is idempotent: an existing Anchor is accepted only when its identity, Sandbox UID, Sandbox
+Pod UID, target and node match. Delete first sends SIGTERM; the mounter retries a normal unmount and
+must exit zero. Only then does manager remove the owned sandbox symlink and finalizer. Partial Claim
+failures roll back all Anchors for that Sandbox. A 30-second reconciler continues interrupted
+finalizer transitions and deletes Anchors whose Sandbox disappeared, returned to the pool, or moved
+to a new Pod UID.
 
 ### Node mounter contract
 
-The node mounter exposes idempotent `Mount`, `Unmount`, and `Inspect` operations. Requests contain
-opaque mount identity plus resolved source and target identifiers; the server resolves and verifies
-actual host paths. It must:
+The node mounter is a static binary inside the Anchor Pod. It has no network listener. Its arguments
+contain only the fixed in-container source and a SHA-256 identity below the fixed target root. It:
 
-- run only on the requested node;
-- authenticate and authorize sandbox-manager requests;
-- reject sources outside known kubelet CSI publish roots;
-- reject targets outside the agent-owned mount-root for the target Sandbox UID;
-- resolve symlinks before applying allowlist checks;
-- use bind mount followed by read-only remount when required;
-- verify `/proc/self/mountinfo` after mount and unmount;
-- make repeat mount/unmount calls return the already-achieved result;
-- use lazy/forced unmount only through an explicit recovery policy, never as the default;
-- never log CSI Secrets.
+- runs only on the Sandbox node selected in the Pod spec;
+- receives the source only through a kubelet-managed PVC mount;
+- rejects sources outside `/source` and targets outside `/target/anchor`;
+- reaches only the exact Sandbox emptyDir host path derived from the Kubernetes-reported Pod UID;
+- uses bind mount followed by read-only remount when required;
+- verifies `/proc/self/mountinfo` after mount and unmount;
+- makes repeat mount/unmount calls return the already-achieved result;
+- never uses lazy/forced unmount by default;
+- never receives or logs CSI Secrets.
 
-The production implementation may be a DaemonSet or a privileged sidecar colocated on eligible
-nodes. This is still an `agent_dp` change: it introduces an agent-owned data-plane component and does
-not require a VEPFS driver modification.
+This remains an `agent_dp` change: the new privileged component is agent-owned and ephemeral, and
+does not require a VEPFS driver modification.
 
 ## Compatibility and rollout
 
 - Existing `CSIMountConfig` and encoded `NodePublishVolumeRequest` consumers remain unchanged.
 - The lifecycle resolver is enabled only for registered staged adapters.
-- VEPFS support is gated by deployment configuration listing eligible node pools and the node
-  mounter endpoint. A missing node mounter fails resolution before a Sandbox is claimed.
+- VEPFS support is gated by the staged-driver allowlist, the Anchor image setting, CSINode
+  registration and operator-managed domain labels. A missing Anchor image fails before Pod creation.
 - Rollout starts on a dedicated VEPFS-domain node pool in `vke-openkruise-test`.
 - Downgrade must first drain staged mounts, then remove anchors and node mounters. Direct providers
   remain usable throughout.
@@ -277,17 +280,18 @@ not require a VEPFS driver modification.
 
 | Risk | Consequence | Mitigation |
 |---|---|---|
-| Wrong domain placement | VEPFS mount fails; node state may be polluted | Pre-claim domain filtering plus atomic node lease |
+| Wrong domain placement | VEPFS mount fails; node state may be polluted | Pre-claim filtering, cold-create nodeSelector, static operator-owned domain label |
 | VCI scheduling | Driver socket/CSINode absent | Require regular VKE node and verify `CSINode` registration |
-| Anchor ready but bind fails | Leaked CSI attachment | Persist state and reconcile; retain anchor until bind cleanup completes |
-| Anchor deleted before unbind | Stale/busy bind mount | Strict unbind-before-release state machine and reference count |
-| Controller crash during transition | Duplicate or leaked operations | Stable identity, idempotent APIs, persisted phases, reconciliation |
-| Mount propagation misconfigured | Host bind is invisible in Sandbox | Admission validation for shared mount-root and `Bidirectional` propagation; E2E assertion |
-| Host-path traversal | Node compromise or cross-tenant access | Server-side UID/path resolution, symlink resolution, fixed allowlists, authentication |
+| Anchor ready but expose fails | Leaked CSI attachment | Roll back the Anchor before failing Claim; reconciler reaps abandoned Pods |
+| Anchor deleted before unbind | Stale/busy bind mount | Pod finalizer; mounter must exit zero before symlink cleanup/finalizer removal |
+| Controller crash during transition | Duplicate or leaked operations | Stable names, Anchor annotations/finalizer and periodic reconciliation |
+| Mount propagation misconfigured | Host bind is invisible in Sandbox | Admission validation for shared mount-root, privileged `Bidirectional` mounter, and unprivileged `HostToContainer` Sandbox; E2E assertion |
+| Host-path traversal | Node compromise or cross-tenant access | Kubernetes Pod UID-derived host path, fixed `/source` and `/target/anchor` roots, SHA-256 identity |
 | Busy unmount | Data corruption or leak | Return retryable error, preserve symlink/state, reconcile; no forced unmount by default |
 | Credential rotation | Remount fails with expired credentials | Keep Secrets in Kubernetes CSI lifecycle; recreate/reconcile anchor using current Secret |
-| Domain appears free after last anchor | Cross-domain join conflict | Persistent domain lease; release only after verified cleanup or node recycling |
+| Domain appears free after last anchor | Cross-domain join conflict | Never clear/reassign the static domain label as part of Anchor cleanup |
 | Random volume identity | Unmount cannot find the mounted target | Stable identity used by both mount and unmount |
+| Sandbox pause/resume | Anchor points to an obsolete Pod emptyDir | Reconciler removes old-Pod Anchors; automatic staged remount on resume is not yet supported |
 
 ## Alternatives considered
 
@@ -321,14 +325,15 @@ semantics. It remains a cold-start fallback when no compatible warm node exists.
    mutate the source request or Kubernetes objects.
 2. **Placement seam:** candidate Sandboxes on same-domain, free, wrong-domain, VCI, and
    driver-missing nodes produce deterministic eligibility decisions before Claim mutation.
-3. **Node mounter seam:** an in-memory contract adapter verifies idempotent mount/unmount ordering,
-   reference counting, path rejection, and recovery state transitions.
+3. **Node mounter seam:** the static binary verifies idempotent mount/unmount, fixed-root path
+   rejection, read-only remount, readiness and signal-driven cleanup.
 4. **Storage CLI seam:** direct providers issue NodePublish/NodeUnpublish, calculate the same target
    identity, preserve paths on failure, and delete only owned links/directories.
 
 ### `vke-openkruise-test` integration tests
 
-1. Deploy the node mounter to a dedicated regular-node pool with bidirectional propagation.
+1. Deploy the Anchor image and inject the shared mount-root with privileged Anchor
+   `Bidirectional` and unprivileged Sandbox `HostToContainer` propagation.
 2. Claim an already-running warm Sandbox with no VEPFS in its original Pod spec.
 3. Dynamically mount a VEPFS PV and verify filesystem type, read/write, unchanged Pod UID, and zero
    container restart count.
@@ -336,12 +341,12 @@ semantics. It remains a cold-start fallback when no compatible warm node exists.
    stale host mount.
 5. Repeat mount/unmount to prove idempotency.
 6. Restart sandbox-manager during `Binding` and during `Unbinding`; verify reconciliation.
-7. Claim the same-domain volume on a second warm Sandbox on the same node; verify anchor reuse and
-   reference counting.
+7. Claim the same-domain RWX volume on a second warm Sandbox; verify distinct per-Sandbox Anchors
+   and no name/ownership collision.
 8. Try a different `mountServiceID` on the occupied node; verify rejection before Claim.
 9. Try a VCI node and a node without the VEPFS `CSINode`; verify rejection before Claim.
-10. Hibernate/resume or recreate the Sandbox and verify the persisted mount intent is restored on a
-    compatible node.
+10. Hibernate/resume and verify the old-Pod Anchor is cleaned; staged mount restoration is expected
+    to fail explicitly until resume orchestration is implemented.
 
 Evidence collected for each test includes Sandbox/anchor UIDs, node, mount-service ID, CSI event
 sequence, `/proc/self/mountinfo`, read/write marker, restart count, mount records, and cleanup state.
@@ -350,8 +355,10 @@ sequence, `/proc/self/mountinfo`, read/write marker, restart count, mount record
 
 - **Phase 1:** complete symmetric direct-provider unmount and safe path cleanup.
 - **Phase 2:** add lifecycle plan/adapter registry and VEPFS resolver with unit tests.
-- **Phase 3:** add domain-aware candidate filtering and persistent node-domain reservation.
-- **Phase 4:** implement authenticated node mounter plus anchor/reference reconciliation.
+- **Phase 3:** add domain-aware warm filtering and cold-create nodeSelector using static
+  operator-owned node domain labels.
+- **Phase 4:** implement the isolated privileged Anchor mounter, finalizer cleanup and orphan
+  reconciliation.
 - **Phase 5:** deploy and run the `vke-openkruise-test` matrix above.
 - **Phase 6:** extract reusable adapter conformance tests and add EFS/FSx or Tencent drivers as their
   exact CSI lifecycle requirements become available.
@@ -363,4 +370,6 @@ sequence, `/proc/self/mountinfo`, read/write marker, restart count, mount record
 - [x] 2026-08-14: Implemented Phase 1 on `feat/vepfs-csi-lifecycle-adapter`.
 - [x] 2026-08-14: Implemented Phase 2 lifecycle plan, capability-based registry selection, VEPFS
   resolver, stable CSI volume identity, and direct-publish rejection tests.
-- [ ] Phase 3 through Phase 6.
+- [x] 2026-08-14: Implemented Phases 3 and 4, including cold-create placement, cross-Sandbox Anchor
+  identity, partial-failure rollback, synchronous unmount and restart/orphan reconciliation.
+- [ ] Phase 5 cluster deployment/E2E and Phase 6 multi-provider conformance extraction.

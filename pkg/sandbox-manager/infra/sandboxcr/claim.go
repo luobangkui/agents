@@ -415,7 +415,7 @@ func runClaimPostProcesses(ctx context.Context, sbx *Sandbox, lockType infra.Loc
 		// sandbox-runtime-storage still enforce the configured per-mount
 		// timeout.
 		mountCtx := csiMountContext(ctx)
-		metrics.CSIMount, err = traceCSIMounts(mountCtx, sbx.Sandbox, *opts.CSIMount, rtOpts...)
+		metrics.CSIMount, err = traceCSIMounts(mountCtx, cache.GetClient(), cache.GetAPIReader(), sbx.Sandbox, *opts.CSIMount, rtOpts...)
 		if err != nil {
 			log.Error(err, "failed to perform csi mount")
 			return fmt.Errorf("failed to perform csi mount: %s", err)
@@ -562,6 +562,10 @@ func pickAnAvailableSandbox(ctx context.Context, opts infra.ClaimSandboxOptions,
 			log.Error(checkErr, "skip invalid sandbox", "sandbox", klog.KObj(obj), "resourceVersion", obj.GetResourceVersion())
 			continue
 		}
+		if checkErr := candidateSupportsStagedMounts(ctx, cache.GetAPIReader(), obj, opts.CSIMount); checkErr != nil {
+			log.Info("skip sandbox that does not satisfy staged CSI placement", "sandbox", klog.KObj(obj), "reason", checkErr)
+			continue
+		}
 		state, _ := utils.GetSandboxState(obj)
 		switch state {
 		case v1alpha1.SandboxStateAvailable:
@@ -693,6 +697,9 @@ func newSandboxFromSandboxSet(ctx context.Context, opts infra.ClaimSandboxOption
 		}
 	}
 	sbx := sandboxset.NewSandboxFromSandboxSet(sbs, refTemplate)
+	if err := applyStagedPlacementToNewSandbox(sbx, opts.CSIMount); err != nil {
+		return nil, "", NoAvailableError(opts.Template, "cannot apply staged CSI placement: "+err.Error())
+	}
 	// sandbox manager creates high-priority sandbox
 	sbx.Annotations[v1alpha1.SandboxAnnotationPriority] = "100"
 	for _, anno := range FilteredAnnotationsOnCreation {

@@ -53,12 +53,15 @@ type PlacementRequirement struct {
 // anchor required by a staged CSI driver. Secret references deliberately remain
 // on the PV and are consumed by Kubernetes; they are not copied into this plan.
 type KubeletAnchorSpec struct {
-	PersistentVolumeName string
-	PersistentVolumeUID  types.UID
-	VolumeHandle         string
-	SubPath              string
-	TargetPath           string
-	ReadOnly             bool
+	PersistentVolumeName           string
+	PersistentVolumeUID            types.UID
+	PersistentVolumeClaimNamespace string
+	PersistentVolumeClaimName      string
+	PersistentVolumeClaimUID       types.UID
+	VolumeHandle                   string
+	SubPath                        string
+	TargetPath                     string
+	ReadOnly                       bool
 }
 
 // MountPlan is the resolved lifecycle intent. Exactly one of PublishRequest and

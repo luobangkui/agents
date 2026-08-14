@@ -19,7 +19,9 @@ package main
 import (
 	"context"
 	"crypto/md5" // #nosec G501 -- non-security short hash
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"fmt"
 	"log"
 	"os"
@@ -44,6 +46,8 @@ var (
 	mountName    string // name of the shared mount-root volume; defaults to "mount-root"
 	debugMode    bool   // when true, sensitive fields such as PublishContext are included in log output
 	mountTimeout time.Duration
+	anchorID     string
+	anchorPath   string
 )
 
 func init() {
@@ -187,6 +191,56 @@ var unmountCmd = &cobra.Command{
 	Run:   unmountRun,
 }
 
+var exposeCmd = &cobra.Command{
+	Use:   "expose",
+	Short: "Expose an already-mounted kubelet anchor at a sandbox path",
+	RunE: func(cmd *cobra.Command, _ []string) error {
+		return runExpose(cmd, false)
+	},
+}
+
+var unexposeCmd = &cobra.Command{
+	Use:   "unexpose",
+	Short: "Remove a sandbox path owned by a kubelet anchor",
+	RunE: func(cmd *cobra.Command, _ []string) error {
+		return runExpose(cmd, true)
+	},
+}
+
+func init() {
+	for _, command := range []*cobra.Command{exposeCmd, unexposeCmd} {
+		command.Flags().StringVar(&anchorID, "identity", "", "stable kubelet-anchor mount identity")
+		command.Flags().StringVar(&anchorPath, "mount-path", "", "user-visible sandbox mount path")
+	}
+}
+
+func runExpose(_ *cobra.Command, remove bool) error {
+	if len(anchorID) != sha256.Size*2 {
+		return fmt.Errorf("anchor identity must be a %d-character SHA-256 digest", sha256.Size*2)
+	}
+	if _, err := hex.DecodeString(anchorID); err != nil {
+		return fmt.Errorf("anchor identity is not hexadecimal: %w", err)
+	}
+	if strings.TrimSpace(anchorPath) == "" || !path.IsAbs(anchorPath) {
+		return fmt.Errorf("anchor mount path must be absolute")
+	}
+	mountRootPath, err := mountFinderFn(mountName, debugMode)
+	if err != nil {
+		return fmt.Errorf("failed to find valid mount path for %q: %w", mountName, err)
+	}
+	target := path.Join(mountRootPath, "anchor", anchorID)
+	if remove {
+		if err := removeSymlinkFn(target, anchorPath); err != nil {
+			return fmt.Errorf("failed to remove anchor symlink %s -> %s: %w", anchorPath, target, err)
+		}
+		return removeMountTargetFn(target)
+	}
+	if err := createSymlinkFn(target, anchorPath); err != nil {
+		return fmt.Errorf("failed to create anchor symlink %s -> %s: %w", anchorPath, target, err)
+	}
+	return nil
+}
+
 func unmountRun(cmd *cobra.Command, args []string) {
 	startTime := time.Now()
 	log.Printf("Received unmount request: driver=%s mountName=%s", driver, mountName)
@@ -276,6 +330,8 @@ func main() {
 	// add sub command line
 	rootCmd.AddCommand(mountCmd)   // register mount subcommand
 	rootCmd.AddCommand(unmountCmd) // register unmount subcommand
+	rootCmd.AddCommand(exposeCmd)  // register kubelet-anchor expose subcommand
+	rootCmd.AddCommand(unexposeCmd)
 	rootCmd.AddCommand(versionCmd) // register version subcommand
 
 	// start to execute command line

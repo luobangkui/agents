@@ -24,6 +24,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -783,6 +784,58 @@ func TestRunUnmountStopsCleanupWhenDriverFails(t *testing.T) {
 
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "unmount failed for driver")
+}
+
+func TestRunExposeAndUnexposeKubeletAnchor(t *testing.T) {
+	originalID, originalPath, originalMountName := anchorID, anchorPath, mountName
+	originalFinder := mountFinderFn
+	originalCreate, originalRemove, originalRemoveTarget := createSymlinkFn, removeSymlinkFn, removeMountTargetFn
+	t.Cleanup(func() {
+		anchorID, anchorPath, mountName = originalID, originalPath, originalMountName
+		mountFinderFn = originalFinder
+		createSymlinkFn, removeSymlinkFn, removeMountTargetFn = originalCreate, originalRemove, originalRemoveTarget
+	})
+
+	anchorID = strings.Repeat("a", 64)
+	anchorPath = "/workspace/vepfs"
+	mountName = "mount-root"
+	mountFinderFn = func(name string, _ bool) (string, error) {
+		require.Equal(t, "mount-root", name)
+		return "/run/csi/mount-root", nil
+	}
+	wantTarget := "/run/csi/mount-root/anchor/" + anchorID
+	var steps []string
+	createSymlinkFn = func(target, linkPath string) error {
+		require.Equal(t, wantTarget, target)
+		require.Equal(t, anchorPath, linkPath)
+		steps = append(steps, "expose")
+		return nil
+	}
+	removeSymlinkFn = func(target, linkPath string) error {
+		require.Equal(t, wantTarget, target)
+		require.Equal(t, anchorPath, linkPath)
+		steps = append(steps, "unexpose")
+		return nil
+	}
+	removeMountTargetFn = func(target string) error {
+		require.Equal(t, wantTarget, target)
+		steps = append(steps, "remove-target")
+		return nil
+	}
+
+	require.NoError(t, runExpose(silentCmd(), false))
+	require.NoError(t, runExpose(silentCmd(), true))
+	require.Equal(t, []string{"expose", "unexpose", "remove-target"}, steps)
+}
+
+func TestRunExposeRejectsUnsafeIdentityAndPath(t *testing.T) {
+	originalID, originalPath := anchorID, anchorPath
+	t.Cleanup(func() { anchorID, anchorPath = originalID, originalPath })
+
+	anchorID, anchorPath = "../escape", "/workspace"
+	require.ErrorContains(t, runExpose(silentCmd(), false), "SHA-256")
+	anchorID, anchorPath = strings.Repeat("a", 64), "relative"
+	require.ErrorContains(t, runExpose(silentCmd(), false), "must be absolute")
 }
 
 func TestBuiltinStorageProviders(t *testing.T) {

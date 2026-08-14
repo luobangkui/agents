@@ -23,6 +23,8 @@ import (
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/google/uuid"
+
+	"github.com/openkruise/agents/pkg/agent-runtime/storages"
 )
 
 type InitRuntimeOptions struct {
@@ -43,12 +45,47 @@ const (
 )
 
 type CSIMountOptions struct {
-	MountOptionList    []MountConfig `json:"mountOptionList"`
-	MountOptionListRaw string        `json:"mountOptionListRaw"` // the raw JSON string for mount options
+	MountOptionList []MountConfig `json:"mountOptionList"`
+	// StagedMountOptionList contains provider-neutral kubelet-anchor plans for
+	// CSI drivers that require ControllerPublish/NodeStage before publish.
+	StagedMountOptionList []StagedMountConfig `json:"stagedMountOptionList,omitempty"`
+	MountOptionListRaw    string              `json:"mountOptionListRaw"` // the raw JSON string for mount options
 	// Concurrency limits concurrent CSI mounts. Non-positive values use DefaultCSIMountConcurrency.
 	Concurrency int `json:"concurrency,omitempty"`
 	// Timeout limits one CSI mount. Non-positive values use DefaultCSIMountTimeout.
 	Timeout time.Duration `json:"timeout,omitempty"`
+}
+
+// StagedMountConfig is an in-process resolved mount. MountPlan's custom JSON
+// rendering redacts provider requests, so nesting it in claim logs is safe.
+type StagedMountConfig struct {
+	Plan storages.MountPlan `json:"plan"`
+}
+
+// AppendMountPlan keeps lifecycle dispatch in one place so every API path
+// (E2B, SandboxClaim, resume and clone) resolves drivers consistently.
+func (o *CSIMountOptions) AppendMountPlan(plan *storages.MountPlan) error {
+	if plan == nil {
+		return fmt.Errorf("mount plan is nil")
+	}
+	switch plan.Strategy {
+	case storages.MountStrategyDirectNodePublish:
+		if plan.PublishRequest == nil {
+			return fmt.Errorf("direct mount plan for driver %q has no publish request", plan.Driver)
+		}
+		o.MountOptionList = append(o.MountOptionList, MountConfig{
+			Driver:         plan.Driver,
+			PublishRequest: plan.PublishRequest,
+		})
+	case storages.MountStrategyKubeletAnchor:
+		if plan.Anchor == nil {
+			return fmt.Errorf("kubelet-anchor mount plan for driver %q has no anchor", plan.Driver)
+		}
+		o.StagedMountOptionList = append(o.StagedMountOptionList, StagedMountConfig{Plan: *plan})
+	default:
+		return fmt.Errorf("unsupported mount strategy %q for driver %q", plan.Strategy, plan.Driver)
+	}
+	return nil
 }
 
 // MountConfig is a single resolved CSI mount intent: the driver that must serve

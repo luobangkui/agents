@@ -49,12 +49,15 @@ func TestVEPFSMountProviderGenerateStagedPlan(t *testing.T) {
 		DomainValue: "mount-aed6284f",
 	}, plan.Placement)
 	require.Equal(t, &KubeletAnchorSpec{
-		PersistentVolumeName: "vepfs-pv",
-		PersistentVolumeUID:  types.UID("pv-uid-1"),
-		VolumeHandle:         "vepfs-volume-handle",
-		SubPath:              "users/42",
-		TargetPath:           "/workspace/data",
-		ReadOnly:             false,
+		PersistentVolumeName:           "vepfs-pv",
+		PersistentVolumeUID:            types.UID("pv-uid-1"),
+		PersistentVolumeClaimNamespace: "storage",
+		PersistentVolumeClaimName:      "vepfs-pvc",
+		PersistentVolumeClaimUID:       types.UID("pvc-uid-1"),
+		VolumeHandle:                   "vepfs-volume-handle",
+		SubPath:                        "users/42",
+		TargetPath:                     "/workspace/data",
+		ReadOnly:                       false,
 	}, plan.Anchor)
 	require.Equal(t, originalAttributes, pv.Spec.CSI.VolumeAttributes, "provider validation must not mutate the PV")
 }
@@ -96,6 +99,9 @@ func TestVEPFSMountProviderRejectsInvalidPV(t *testing.T) {
 		{name: "missing PV UID", mutate: func(pv *corev1.PersistentVolume) {
 			pv.UID = ""
 		}, wantErr: "volume UID"},
+		{name: "missing claim ref", mutate: func(pv *corev1.PersistentVolume) {
+			pv.Spec.ClaimRef = nil
+		}, wantErr: "persistent volume claim"},
 		{name: "missing fsid", mutate: func(pv *corev1.PersistentVolume) {
 			delete(pv.Spec.CSI.VolumeAttributes, VEPFSAttributeFSID)
 		}, wantErr: "fsid"},
@@ -133,6 +139,11 @@ func validVEPFSPV() *corev1.PersistentVolume {
 	return &corev1.PersistentVolume{
 		ObjectMeta: metav1.ObjectMeta{Name: "vepfs-pv", UID: types.UID("pv-uid-1")},
 		Spec: corev1.PersistentVolumeSpec{
+			ClaimRef: &corev1.ObjectReference{
+				Namespace: "storage",
+				Name:      "vepfs-pvc",
+				UID:       types.UID("pvc-uid-1"),
+			},
 			PersistentVolumeSource: corev1.PersistentVolumeSource{
 				CSI: &corev1.CSIPersistentVolumeSource{
 					Driver:       VEPFSCSIDriverName,

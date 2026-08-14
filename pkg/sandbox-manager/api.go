@@ -448,6 +448,13 @@ func (m *SandboxManager) DeleteSandbox(ctx context.Context, opts DeleteSandboxOp
 	log := klog.FromContext(ctx).WithValues("sandbox", klog.KObj(opts.Sandbox))
 	sbx := opts.Sandbox
 
+	if cleaner, ok := m.infra.(infra.DynamicMountCleaner); ok {
+		if err := cleaner.CleanupDynamicMounts(ctx, sbx); err != nil {
+			log.Error(err, "failed to clean dynamic mounts before sandbox recycle/delete")
+			return fmt.Errorf("failed to clean dynamic mounts: %w", err)
+		}
+	}
+
 	if sbx.IsRecycleEnabled() && sbx.Phase() == string(v1alpha1.SandboxRunning) {
 		log.Info("sandbox is recycle-enabled, triggering recycle instead of deletion")
 		start := time.Now()

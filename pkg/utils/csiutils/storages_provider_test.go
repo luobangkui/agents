@@ -956,6 +956,11 @@ func TestGenerateMountPlanUsesVEPFSStagedCapability(t *testing.T) {
 	pv := &corev1.PersistentVolume{
 		ObjectMeta: metav1.ObjectMeta{Name: "vepfs-pv", UID: types.UID("vepfs-pv-uid")},
 		Spec: corev1.PersistentVolumeSpec{
+			ClaimRef: &corev1.ObjectReference{
+				Namespace: "storage",
+				Name:      "vepfs-pvc",
+				UID:       types.UID("vepfs-pvc-uid"),
+			},
 			PersistentVolumeSource: corev1.PersistentVolumeSource{
 				CSI: &corev1.CSIPersistentVolumeSource{
 					Driver:       storages.VEPFSCSIDriverName,

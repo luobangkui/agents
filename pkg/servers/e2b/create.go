@@ -490,22 +490,19 @@ func (sc *Controller) buildCSIMountOptions(ctx context.Context, request models.N
 		return nil, nil
 	}
 
-	csiMountOptions := make([]config.MountConfig, 0, len(request.Extensions.CSIMount.MountConfigs))
+	opts := &config.CSIMountOptions{}
 	csiClient := csiutils.NewCSIMountHandler(sc.cache.GetClient(), sc.cache.GetAPIReader(), sc.storageRegistry, utils.DefaultSandboxDeployNamespace)
 	for _, mountConfig := range request.Extensions.CSIMount.MountConfigs {
-		driverName, publishRequest, err := csiClient.GenerateNodePublishVolumeRequest(ctx, mountConfig)
+		plan, err := csiClient.GenerateMountPlan(ctx, mountConfig)
 		if err != nil {
 			return nil, err
 		}
-		csiMountOptions = append(csiMountOptions, config.MountConfig{
-			Driver:         driverName,
-			PublishRequest: publishRequest,
-		})
+		if err := opts.AppendMountPlan(plan); err != nil {
+			return nil, err
+		}
 	}
 
-	return &config.CSIMountOptions{
-		MountOptionList: csiMountOptions,
-	}, nil
+	return opts, nil
 }
 
 // injectStorageAuthAnnotation injects the storage-auth annotation into the sandbox
