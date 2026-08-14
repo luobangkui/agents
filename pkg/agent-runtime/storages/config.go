@@ -37,9 +37,20 @@ var (
 func init() {
 	dynamicDriverList := strings.Split(os.Getenv(common.ENV_DYNAMIC_STORAGE_DRIVER_LIST), ",")
 	for _, driverName := range dynamicDriverList {
+		driverName = strings.TrimSpace(driverName)
+		if driverName == "" {
+			continue
+		}
 		initializeProviderFuncs = append(initializeProviderFuncs,
 			func(sp *StorageProvider) {
-				sp.RegisterProvider(driverName, &MountProvider{})
+				sp.RegisterProvider(driverName, newProviderForDriver(driverName))
 			})
 	}
+}
+
+func newProviderForDriver(driverName string) VolumeMountProvider {
+	if driverName == VEPFSCSIDriverName {
+		return &VEPFSMountProvider{}
+	}
+	return &MountProvider{}
 }
