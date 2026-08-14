@@ -17,6 +17,7 @@ limitations under the License.
 package oss
 
 import (
+	"context"
 	"maps"
 	"testing"
 
@@ -83,4 +84,18 @@ func TestProviderIdentity(t *testing.T) {
 	p := &provider{}
 	require.Equal(t, driverName, p.Driver())
 	require.Equal(t, "oss", p.SubDir())
+}
+
+func TestProviderUnmountUsesCSIUnpublish(t *testing.T) {
+	req := csi.NodePublishVolumeRequest{VolumeId: "oss-pv-1", TargetPath: "/real/oss/target"}
+	originalRunner := runNodeUnpublishVolumeFn
+	runNodeUnpublishVolumeFn = func(ctx context.Context, driver string, got csi.NodePublishVolumeRequest) error {
+		require.NotNil(t, ctx)
+		require.Equal(t, driverName, driver)
+		require.Equal(t, req, got)
+		return nil
+	}
+	t.Cleanup(func() { runNodeUnpublishVolumeFn = originalRunner })
+
+	require.NoError(t, (&provider{}).Unmount(context.Background(), req))
 }

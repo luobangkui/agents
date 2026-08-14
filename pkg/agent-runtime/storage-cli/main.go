@@ -73,9 +73,12 @@ var mountCmd = &cobra.Command{
 // Tests in the same package may replace these to inject fakes;
 // production code MUST NOT reassign them.
 var (
-	mountFinderFn   = mountfinder.FindMountPath
-	storageLookupFn = storage.Lookup
-	createSymlinkFn = link.CreateSymlink
+	mountFinderFn       = mountfinder.FindMountPath
+	storageLookupFn     = storage.Lookup
+	createSymlinkFn     = link.CreateSymlink
+	removeSymlinkFn     = link.RemoveSymlink
+	removeMountTargetFn = removeMountTarget
+	runUnmountFn        = runUnmount
 )
 
 func rootRun(cmd *cobra.Command, args []string) {
@@ -185,13 +188,86 @@ var unmountCmd = &cobra.Command{
 }
 
 func unmountRun(cmd *cobra.Command, args []string) {
-	err := validateUnmountParams() // unmount uses the same parameter validation
-	if err != nil {
-		log.Printf("Error: %v\n", err)
-		cmd.Help() // #nosec G104 -- help output error is non-actionable
-		return
+	startTime := time.Now()
+	log.Printf("Received unmount request: driver=%s mountName=%s", driver, mountName)
+	if err := runUnmountFn(cmd); err != nil {
+		log.Printf("Unmount failed (costMs=%d): %v", time.Since(startTime).Milliseconds(), err)
+		os.Exit(1)
 	}
-	// TODO
+	log.Printf("Unmount succeeded (costMs=%d)", time.Since(startTime).Milliseconds())
+}
+
+// runUnmount resolves the same real target as runMount, asks the provider to
+// release it, and then removes only paths owned by this CLI. Cleanup is ordered
+// deliberately: a failed driver unmount must leave the user-visible symlink in
+// place so the mount can be retried without losing its identity.
+func runUnmount(cmd *cobra.Command) error {
+	if mountTimeout <= 0 {
+		return fmt.Errorf("mount timeout must be greater than 0")
+	}
+
+	configRaw, err := base64.StdEncoding.DecodeString(config)
+	if err != nil {
+		cmd.Help() // #nosec G104 -- help output error is non-actionable
+		return fmt.Errorf("failed to decode CSI request config: %w", err)
+	}
+
+	csiReq := csi.NodePublishVolumeRequest{}
+	if err := proto.Unmarshal(configRaw, &csiReq); err != nil {
+		cmd.Help() // #nosec G104 -- help output error is non-actionable
+		return fmt.Errorf("failed to unmarshal CSI request: %w", err)
+	}
+	if strings.TrimSpace(csiReq.VolumeId) == "" {
+		return fmt.Errorf("volume ID is required for unmount")
+	}
+	if strings.TrimSpace(csiReq.TargetPath) == "" {
+		return fmt.Errorf("target path is required for unmount")
+	}
+
+	originDirectory := csiReq.TargetPath
+	mountTargetHash := getMountTargetHash(driver, csiReq)
+	mountRootPath, err := mountFinderFn(mountName, debugMode)
+	if err != nil {
+		return fmt.Errorf("failed to find valid mount path for %q: %w", mountName, err)
+	}
+
+	provider, ok := storageLookupFn(driver)
+	if !ok {
+		log.Printf("Supported drivers: %v", storage.Drivers())
+		cmd.Help() // #nosec G104 -- help output error is non-actionable
+		return fmt.Errorf("unsupported storage driver: %s", driver)
+	}
+
+	toMountTargetPath := path.Join(mountRootPath, provider.SubDir(), mountTargetHash)
+	csiReq.TargetPath = toMountTargetPath
+
+	parentCtx := cmd.Context()
+	if parentCtx == nil {
+		parentCtx = context.Background()
+	}
+	unmountCtx, cancel := context.WithTimeout(parentCtx, mountTimeout)
+	defer cancel()
+	if err := provider.Unmount(unmountCtx, csiReq); err != nil {
+		return fmt.Errorf("unmount failed for driver %s: %w", driver, err)
+	}
+	if err := removeSymlinkFn(toMountTargetPath, originDirectory); err != nil {
+		return fmt.Errorf("failed to remove symlink %s -> %s: %w", originDirectory, toMountTargetPath, err)
+	}
+	if err := removeMountTargetFn(toMountTargetPath); err != nil {
+		return err
+	}
+	return nil
+}
+
+func removeMountTarget(target string) error {
+	err := os.Remove(target)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("failed to remove mount target %s: %w", target, err)
+	}
+	return nil
 }
 
 func main() {
@@ -213,10 +289,6 @@ func validateGeneralParams(csiReq csi.NodePublishVolumeRequest) error {
 	if strings.TrimSpace(csiReq.VolumeContext["csi.storage.k8s.io/pod.uid"]) == "" {
 		return fmt.Errorf("Pod UID is required. Use csi.storage.k8s.io/pod.uid setting")
 	}
-	return nil
-}
-
-func validateUnmountParams() error {
 	return nil
 }
 

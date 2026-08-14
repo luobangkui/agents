@@ -179,13 +179,6 @@ func TestValidateGeneralParams_ExpectError(t *testing.T) {
 	}
 }
 
-// TestValidateUnmountParams documents the current contract: unmount has no
-// required parameters and must always succeed. If this changes, the test
-// must be updated alongside the implementation.
-func TestValidateUnmountParams(t *testing.T) {
-	assert.NoError(t, validateUnmountParams())
-}
-
 // TestRootRun verifies the root command help handler is invoked without
 // panic and emits non-empty help output.
 func TestRootRun(t *testing.T) {
@@ -200,13 +193,18 @@ func TestRootRun(t *testing.T) {
 	assert.NotEmpty(t, out.String(), "rootRun should emit help output")
 }
 
-// TestUnmountRun ensures unmountRun completes without panic when validation
-// passes (the only currently exercised branch given validateUnmountParams
-// always returns nil).
+// TestUnmountRun ensures the cobra handler delegates to the testable unmount
+// implementation without terminating the process on success.
 func TestUnmountRun(t *testing.T) {
 	cmd := newCommandForHelpCapture()
 	cmd.SetOut(&bytes.Buffer{})
 	cmd.SetErr(&bytes.Buffer{})
+	originalRunUnmount := runUnmountFn
+	runUnmountFn = func(got *cobra.Command) error {
+		assert.Same(t, cmd, got)
+		return nil
+	}
+	t.Cleanup(func() { runUnmountFn = originalRunUnmount })
 
 	assert.NotPanics(t, func() {
 		unmountRun(cmd, nil)
@@ -395,6 +393,7 @@ type fakeProvider struct {
 	subDir     string
 	validateFn func(csi.NodePublishVolumeRequest) error
 	mountFn    func(context.Context, csi.NodePublishVolumeRequest) error
+	unmountFn  func(context.Context, csi.NodePublishVolumeRequest) error
 }
 
 func (f *fakeProvider) Driver() string { return f.driverName }
@@ -416,7 +415,11 @@ func (f *fakeProvider) Mount(ctx context.Context, req csi.NodePublishVolumeReque
 	}
 	return nil
 }
-func (f *fakeProvider) Unmount(_ context.Context, _ csi.NodePublishVolumeRequest) error {
+
+func (f *fakeProvider) Unmount(ctx context.Context, req csi.NodePublishVolumeRequest) error {
+	if f.unmountFn != nil {
+		return f.unmountFn(ctx, req)
+	}
 	return nil
 }
 
@@ -440,6 +443,8 @@ func withRunMountEnv(t *testing.T, d, cfg, mn string) {
 	origMountFinderFn := mountFinderFn
 	origStorageLookupFn := storageLookupFn
 	origCreateSymlinkFn := createSymlinkFn
+	origRemoveSymlinkFn := removeSymlinkFn
+	origRemoveMountTargetFn := removeMountTargetFn
 	driver, config, mountName = d, cfg, mn
 	mountTimeout = storage.DefaultNodePublishVolumeTimeout
 	t.Cleanup(func() {
@@ -450,6 +455,8 @@ func withRunMountEnv(t *testing.T, d, cfg, mn string) {
 		mountFinderFn = origMountFinderFn
 		storageLookupFn = origStorageLookupFn
 		createSymlinkFn = origCreateSymlinkFn
+		removeSymlinkFn = origRemoveSymlinkFn
+		removeMountTargetFn = origRemoveMountTargetFn
 	})
 }
 
@@ -693,6 +700,89 @@ func TestRunMountPassesConfiguredTimeout(t *testing.T) {
 	}
 
 	assert.NoError(t, runMount(silentCmd()))
+}
+
+func TestRunUnmountReleasesMountAndOwnedPaths(t *testing.T) {
+	const (
+		fakeDriver    = "fake.csi.example.com"
+		fakeMountRoot = "/fake/mount-root"
+		originTarget  = "/data/workspace"
+	)
+	req := &csi.NodePublishVolumeRequest{
+		VolumeId:   "vol-001",
+		TargetPath: originTarget,
+		VolumeContext: map[string]string{
+			"path": "/tenant/session-a",
+		},
+	}
+	withRunMountEnv(t, fakeDriver, makeBase64CSIConfig(t, req), "mount-root")
+	log.SetOutput(io.Discard)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+
+	expectedTarget := "/fake/mount-root/fake/" + getMountTargetHash(fakeDriver, *req)
+	var steps []string
+	mountFinderFn = func(_ string, _ bool) (string, error) { return fakeMountRoot, nil }
+	storageLookupFn = func(_ string) (storage.Provider, bool) {
+		return &fakeProvider{
+			driverName: fakeDriver,
+			subDir:     "fake",
+			unmountFn: func(ctx context.Context, got csi.NodePublishVolumeRequest) error {
+				deadline, ok := ctx.Deadline()
+				require.True(t, ok)
+				assert.False(t, deadline.IsZero())
+				assert.Equal(t, "vol-001", got.VolumeId)
+				assert.Equal(t, expectedTarget, got.TargetPath)
+				steps = append(steps, "provider-unmount")
+				return nil
+			},
+		}, true
+	}
+	removeSymlinkFn = func(target, linkPath string) error {
+		assert.Equal(t, expectedTarget, target)
+		assert.Equal(t, originTarget, linkPath)
+		steps = append(steps, "remove-symlink")
+		return nil
+	}
+	removeMountTargetFn = func(target string) error {
+		assert.Equal(t, expectedTarget, target)
+		steps = append(steps, "remove-target")
+		return nil
+	}
+
+	err := runUnmount(silentCmd())
+
+	assert.NoError(t, err)
+	assert.Equal(t, []string{"provider-unmount", "remove-symlink", "remove-target"}, steps)
+}
+
+func TestRunUnmountStopsCleanupWhenDriverFails(t *testing.T) {
+	req := &csi.NodePublishVolumeRequest{VolumeId: "vol-001", TargetPath: "/data/workspace"}
+	withRunMountEnv(t, "fake.csi.example.com", makeBase64CSIConfig(t, req), "mount-root")
+	log.SetOutput(io.Discard)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+
+	mountFinderFn = func(_ string, _ bool) (string, error) { return "/fake/root", nil }
+	storageLookupFn = func(_ string) (storage.Provider, bool) {
+		return &fakeProvider{
+			driverName: "fake.csi.example.com",
+			unmountFn: func(context.Context, csi.NodePublishVolumeRequest) error {
+				return fmt.Errorf("target is busy")
+			},
+		}, true
+	}
+	removeSymlinkFn = func(string, string) error {
+		t.Fatal("symlink cleanup must not run after driver failure")
+		return nil
+	}
+	removeMountTargetFn = func(string) error {
+		t.Fatal("target cleanup must not run after driver failure")
+		return nil
+	}
+
+	err := runUnmount(silentCmd())
+
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "unmount failed for driver")
 }
 
 func TestBuiltinStorageProviders(t *testing.T) {

@@ -38,7 +38,7 @@ func TestCreateSymlinkBranches(t *testing.T) {
 	}
 
 	tests := []struct {
-		name        string
+		name string
 		// setup returns (target, link). If empty, the field is taken as-is.
 		setup       func(t *testing.T, dir string) (target, link string)
 		expectError string
@@ -245,4 +245,63 @@ func assertSymlink(t *testing.T, link, wantTarget string) {
 	if got != wantTarget {
 		t.Errorf("symlink target: want %q, got %q", wantTarget, got)
 	}
+}
+
+func TestRemoveSymlink(t *testing.T) {
+	t.Run("removes the expected mount symlink", func(t *testing.T) {
+		dir := t.TempDir()
+		target := filepath.Join(dir, "mount-target")
+		linkPath := filepath.Join(dir, "workspace")
+		if err := os.Mkdir(target, 0o755); err != nil {
+			t.Fatalf("mkdir target: %v", err)
+		}
+		if err := os.Symlink(target, linkPath); err != nil {
+			t.Fatalf("create symlink: %v", err)
+		}
+
+		if err := RemoveSymlink(target, linkPath); err != nil {
+			t.Fatalf("RemoveSymlink() error = %v", err)
+		}
+		if _, err := os.Lstat(linkPath); !os.IsNotExist(err) {
+			t.Fatalf("link still exists or lstat returned unexpected error: %v", err)
+		}
+	})
+
+	t.Run("missing link is idempotent", func(t *testing.T) {
+		dir := t.TempDir()
+		if err := RemoveSymlink(filepath.Join(dir, "target"), filepath.Join(dir, "missing")); err != nil {
+			t.Fatalf("RemoveSymlink() error = %v", err)
+		}
+	})
+
+	t.Run("refuses to remove a symlink owned by another mount", func(t *testing.T) {
+		dir := t.TempDir()
+		expectedTarget := filepath.Join(dir, "expected")
+		otherTarget := filepath.Join(dir, "other")
+		linkPath := filepath.Join(dir, "workspace")
+		if err := os.Symlink(otherTarget, linkPath); err != nil {
+			t.Fatalf("create symlink: %v", err)
+		}
+
+		err := RemoveSymlink(expectedTarget, linkPath)
+		if err == nil || !strings.Contains(err.Error(), "points to unexpected target") {
+			t.Fatalf("RemoveSymlink() error = %v, want unexpected-target error", err)
+		}
+		if _, err := os.Lstat(linkPath); err != nil {
+			t.Fatalf("foreign symlink was removed: %v", err)
+		}
+	})
+
+	t.Run("refuses to remove a real directory", func(t *testing.T) {
+		dir := t.TempDir()
+		linkPath := filepath.Join(dir, "workspace")
+		if err := os.Mkdir(linkPath, 0o755); err != nil {
+			t.Fatalf("mkdir link path: %v", err)
+		}
+
+		err := RemoveSymlink(filepath.Join(dir, "target"), linkPath)
+		if err == nil || !strings.Contains(err.Error(), "is not a symlink") {
+			t.Fatalf("RemoveSymlink() error = %v, want non-symlink error", err)
+		}
+	})
 }

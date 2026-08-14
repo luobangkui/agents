@@ -23,6 +23,9 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"path"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -109,6 +112,57 @@ func csiMount(
 	return nil
 }
 
+// CSIUnmount releases a dynamic mount through the legacy sandbox-storage CLI.
+// It accepts the original NodePublishVolume request because that is the stable
+// identity contract shared with the mount command.
+func CSIUnmount(ctx context.Context, sbx *agentsv1alpha1.Sandbox, driver string, request string) error {
+	return csiUnmount(ctx, sbx, driver, request, csiMountTimeout)
+}
+
+func csiUnmount(
+	ctx context.Context,
+	sbx *agentsv1alpha1.Sandbox,
+	driver string,
+	request string,
+	timeout time.Duration,
+) error {
+	log := klog.FromContext(ctx).WithValues("sandbox", klog.KObj(sbx))
+	startTime := time.Now()
+	if timeout <= 0 {
+		timeout = config.DefaultCSIMountTimeout
+	}
+	processConfig := &process.ProcessConfig{
+		Cmd: MountCommand,
+		Args: []string{
+			"unmount",
+			"--driver", driver,
+			"--config", request,
+			"--timeout", timeout.String(),
+		},
+		Envs: map[string]string{
+			"POD_UID": string(sbx.Status.PodInfo.PodUID),
+		},
+	}
+
+	result, err := RunCommandWithRuntime(ctx, RunCmdFuncArgs{
+		Sbx:           sbx,
+		ProcessConfig: processConfig,
+		Timeout:       timeout,
+		AuthUser:      "root",
+	})
+	if err != nil {
+		log.Error(err, "failed to run CSI unmount command", "stdout", result.Stdout, "stderr", result.Stderr)
+		return err
+	}
+	if result.ExitCode != 0 {
+		err = fmt.Errorf("command failed: [%d] %s", result.ExitCode, result.Stderr)
+		log.Error(err, "CSI unmount command failed", "exitCode", result.ExitCode)
+		return err
+	}
+	log.Info("execute csi unmount command", "driverName", driver, "unmountCost", time.Since(startTime))
+	return nil
+}
+
 // ProcessCSIMounts performs CSI volume mounting operations for all mount configurations concurrently.
 // It uses opts.Concurrency to limit the number of concurrent mount goroutines.
 // If Concurrency is 0 or negative, it defaults to config.DefaultCSIMountConcurrency.
@@ -171,6 +225,38 @@ func ProcessCSIMounts(ctx context.Context, sbx *agentsv1alpha1.Sandbox, opts con
 	return time.Since(start), errors.Join(errs...)
 }
 
+// ProcessCSIUnmounts releases all resolved mounts. Targets are processed
+// deepest-first and sequentially so a parent path cannot be detached while a
+// nested child mount is still active. All failures are collected to give later
+// targets a chance to clean up.
+func ProcessCSIUnmounts(ctx context.Context, sbx *agentsv1alpha1.Sandbox, opts config.CSIMountOptions, rtOpts ...Option) (time.Duration, error) {
+	start := time.Now()
+	timeout := opts.Timeout
+	if timeout <= 0 {
+		timeout = csiMountTimeout
+	}
+	unmounts := append([]config.MountConfig(nil), opts.MountOptionList...)
+	sort.SliceStable(unmounts, func(i, j int) bool {
+		return mountPathDepth(unmounts[i].PublishRequest) > mountPathDepth(unmounts[j].PublishRequest)
+	})
+
+	var errs []error
+	for _, opt := range unmounts {
+		_, err := doCSIUnmountWithTimeout(ctx, sbx, opt, timeout, rtOpts...)
+		if err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return time.Since(start), errors.Join(errs...)
+}
+
+func mountPathDepth(req *csi.NodePublishVolumeRequest) int {
+	if req == nil {
+		return -1
+	}
+	return strings.Count(path.Clean(req.TargetPath), "/")
+}
+
 // doCSIMount performs a single CSI mount, dispatching between the two coexisting
 // transports: the runtime storage API (HTTPS, when rtOpts carries the TLS options
 // for a TLS-capable sandbox) and the legacy sandbox-storage CLI (plaintext envd
@@ -219,6 +305,46 @@ func doCSIMountWithTimeout(
 	// statement time.Since would be evaluated before the call it is meant to
 	// measure, reporting a duration that excludes the mount itself.
 	err = csiMount(ctx, sbx, opts.Driver, requestRaw, timeout)
+	return time.Since(start), err
+}
+
+func doCSIUnmountWithTimeout(
+	ctx context.Context,
+	sbx *agentsv1alpha1.Sandbox,
+	opts config.MountConfig,
+	timeout time.Duration,
+	rtOpts ...Option,
+) (time.Duration, error) {
+	ctx = logs.Extend(ctx, "action", "csiUnmount")
+	if timeout <= 0 {
+		timeout = config.DefaultCSIMountTimeout
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	start := time.Now()
+	if opts.PublishRequest == nil {
+		return time.Since(start), fmt.Errorf("csi publish request is required for unmount driver %q", opts.Driver)
+	}
+	if len(rtOpts) > 0 {
+		storageAPI := NewRuntime(sbx, rtOpts...).Storage()
+		unmountAPI, ok := storageAPI.(StorageUnmountAPI)
+		if !ok {
+			return time.Since(start), fmt.Errorf("runtime storage API does not support unmount")
+		}
+		_, err := unmountAPI.Unmount(ctx, DeleteMountRequest{
+			Driver:         opts.Driver,
+			PublishRequest: opts.PublishRequest,
+		})
+		if err != nil {
+			return time.Since(start), fmt.Errorf("failed to unmount via runtime storage API for driver %q: %w", opts.Driver, err)
+		}
+		return time.Since(start), nil
+	}
+	requestRaw, err := encodePublishRequest(opts.PublishRequest)
+	if err != nil {
+		return time.Since(start), fmt.Errorf("failed to encode csi publish request for unmount driver %q: %w", opts.Driver, err)
+	}
+	err = csiUnmount(ctx, sbx, opts.Driver, requestRaw, timeout)
 	return time.Since(start), err
 }
 

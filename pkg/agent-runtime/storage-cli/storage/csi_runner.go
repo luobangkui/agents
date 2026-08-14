@@ -83,6 +83,40 @@ func RunNodePublishVolume(ctx context.Context, driver string, req csi.NodePublis
 	return nil
 }
 
+// RunNodeUnpublishVolume dials the CSI plugin socket for the given driver and
+// releases the target created by RunNodePublishVolume. CSI defines unpublish as
+// idempotent, so callers may safely retry this operation after partial cleanup.
+func RunNodeUnpublishVolume(ctx context.Context, driver string, publishReq csi.NodePublishVolumeRequest) error {
+	socketPath := path.Join(CsiSocketDir, driver, CsiSocketFile)
+	client, closer, err := newClientFn(socketPath)
+	if err != nil {
+		return fmt.Errorf("create CSI client for driver %q: %w", driver, err)
+	}
+	defer closer.Close()
+
+	req := &csi.NodeUnpublishVolumeRequest{
+		VolumeId:   publishReq.VolumeId,
+		TargetPath: publishReq.TargetPath,
+	}
+	log.Printf("Sending NodeUnpublishVolume request: driver=%s volumeId=%s targetPath=%s",
+		driver, req.VolumeId, req.TargetPath)
+
+	callCtx := ctx
+	cancel := func() {}
+	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+		callCtx, cancel = context.WithTimeout(ctx, DefaultNodePublishVolumeTimeout)
+	}
+	defer cancel()
+
+	start := time.Now()
+	resp, err := client.NodeUnpublishVolume(callCtx, req, grpc.WaitForReady(true))
+	if err != nil {
+		return fmt.Errorf("NodeUnpublishVolume failed for driver %q: %w", driver, err)
+	}
+	log.Printf("NodeUnpublishVolume succeeded: driver=%s resp=%v costMs=%d", driver, resp, time.Since(start).Milliseconds())
+	return nil
+}
+
 // newCSIClient opens a unix-socket gRPC connection to a CSI plugin.
 func newCSIClient(socketPath string) (csi.NodeClient, *grpc.ClientConn, error) {
 	conn, err := grpc.Dial(

@@ -783,6 +783,43 @@ func TestDoCSIMount_LegacyTransportEncodesRequest(t *testing.T) {
 	assert.Equal(t, []string{"--timeout", "30s"}, args[5:])
 }
 
+func TestProcessCSIUnmountsUsesLegacyUnmountContract(t *testing.T) {
+	publishRequest := testPublishRequest("/data/workspace")
+	gotArgs := make(chan []string, 1)
+	handler := &mockProcessHandler{
+		startFn: func(_ context.Context, req *connect.Request[process.StartRequest], stream *connect.ServerStream[process.StartResponse]) error {
+			gotArgs <- req.Msg.Process.Args
+			if err := stream.Send(&process.StartResponse{Event: &process.ProcessEvent{
+				Event: &process.ProcessEvent_Start{Start: &process.ProcessEvent_StartEvent{Pid: 1}},
+			}}); err != nil {
+				return err
+			}
+			return stream.Send(&process.StartResponse{Event: &process.ProcessEvent{
+				Event: &process.ProcessEvent_End{End: &process.ProcessEvent_EndEvent{ExitCode: 0, Exited: true}},
+			}})
+		},
+	}
+	_, sbx := newMockRuntimeServer(t, handler)
+	opts := config.CSIMountOptions{MountOptionList: []config.MountConfig{{
+		Driver:         "nfs",
+		PublishRequest: publishRequest,
+	}}}
+
+	duration, err := ProcessCSIUnmounts(context.Background(), sbx, opts)
+
+	require.NoError(t, err)
+	require.Positive(t, duration)
+	args := <-gotArgs
+	require.Len(t, args, 7)
+	assert.Equal(t, []string{"unmount", "--driver", "nfs", "--config"}, args[:4])
+	raw, err := base64.StdEncoding.DecodeString(args[4])
+	require.NoError(t, err)
+	decoded := &csi.NodePublishVolumeRequest{}
+	require.NoError(t, proto.Unmarshal(raw, protoadapt.MessageV2Of(decoded)))
+	assert.True(t, protoEqual(publishRequest, decoded))
+	assert.Equal(t, []string{"--timeout", "30s"}, args[5:])
+}
+
 // TestDoCSIMount_TransportDispatch verifies the storage-API side of the two
 // coexisting mount transports: non-empty rtOpts route the mount through the
 // runtime storage API (POST /v1/storage/mounts) instead of the legacy CLI, and
