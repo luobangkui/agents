@@ -372,4 +372,42 @@ sequence, `/proc/self/mountinfo`, read/write marker, restart count, mount record
   resolver, stable CSI volume identity, and direct-publish rejection tests.
 - [x] 2026-08-14: Implemented Phases 3 and 4, including cold-create placement, cross-Sandbox Anchor
   identity, partial-failure rollback, synchronous unmount and restart/orphan reconciliation.
-- [ ] Phase 5 cluster deployment/E2E and Phase 6 multi-provider conformance extraction.
+- [x] 2026-08-14: Deployed the Phase 5 core path to `vke-openkruise-test` and completed real
+  warm-pool and cold-create VEPFS mount/unmount acceptance tests. The extended fault-injection
+  matrix remains follow-up work together with Phase 6 multi-provider conformance extraction.
+
+### 2026-08-14 cluster acceptance evidence
+
+The test cluster ran manager image
+`sandbox-manager:vepfs-a70da2b-20260814`, Anchor image
+`sandbox-manager:anchor-vepfs-190806b-20260814-1605`, and runtime image
+`sandbox-manager:runtime-vepfs-190806b-20260814-1605`. Both regular VKE nodes with a live
+`mount-aed6284f` client were labelled
+`vepfs.csi.volcengine.com/mount-service=mount-aed6284f`; the manager service account was granted
+the Pod mutation, Node read and CSINode read permissions required by the lifecycle executor.
+
+The warm-pool acceptance test proved all of the following:
+
+- the already-running Sandbox Pod had UID `fe3e209d-f430-4d0a-a53f-00f0baf00ef5`, zero restarts,
+  and only `envd-volume` plus the injected `mount-root` emptyDir before Claim;
+- Claim selected that same Pod on node `10.112.159.103`; it did not recreate or restart it;
+- Anchor `csi-anchor-6348f77548ee574c72c8` used the source PVC
+  `wenyon-warm-root-vepfs-cnbjc9c1ddd1d652` and the target host path derived from that exact Pod
+  UID, with a privileged mounter and `Bidirectional` target propagation;
+- Kubernetes emitted `SuccessfulAttachVolume`, and the Sandbox observed the propagated mount as
+  GPFS source `fs_vepfs-cnbjc9c1ddd1d652`; a marker was written and read back successfully;
+- DELETE returned HTTP 204; the marker was removed first, then the Anchor, Sandbox CR and original
+  Pod were all deleted without a test Anchor remaining.
+
+The cold-create acceptance test started from a template with `replicas: 0` and no node selector.
+Manager resolved the PVC's `mountServiceID`, injected
+`vepfs.csi.volcengine.com/mount-service=mount-aed6284f`, and scheduled the new Sandbox to
+`10.112.159.103`. Pod UID `b72e19f6-b921-4f77-ae44-3cb77e585081` remained at zero restarts.
+Anchor `csi-anchor-8b27133cc97910a031c0` used the same-node Pod UID host path and bidirectional
+propagation; CSI attach, GPFS detection, and marker write/read all succeeded. DELETE returned HTTP
+204 and removed the Anchor, Sandbox and Pod. The two temporary SandboxSets and all marker files
+were removed after testing.
+
+The final cluster audit reported one ready/available/updated manager replica, both manager
+containers ready with zero restarts, effective runtime/CSI injection, the required RBAC checks
+returning `yes`, and no E2E Sandbox, Pod, SandboxSet or Anchor residue.
