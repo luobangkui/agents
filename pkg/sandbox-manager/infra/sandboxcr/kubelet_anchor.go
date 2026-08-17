@@ -54,16 +54,27 @@ const (
 	KubeletAnchorSandboxUIDAnno     = "agents.kruise.io/anchor-sandbox-uid"
 	KubeletAnchorSandboxPodUIDAnno  = "agents.kruise.io/anchor-sandbox-pod-uid"
 	KubeletAnchorPVAnnotation       = "agents.kruise.io/anchor-pv"
+	KubeletAnchorExposureStateAnno  = "agents.kruise.io/anchor-exposure-state"
+	KubeletAnchorExposureUpdateAnno = "agents.kruise.io/anchor-exposure-updated-at"
 	KubeletAnchorFinalizer          = "agents.kruise.io/kubelet-anchor-cleanup"
 	KubeletAnchorContainerName      = "kubelet-anchor-mounter"
 
 	defaultKubeletAnchorTimeout  = 2 * time.Minute
 	kubeletAnchorReconcilePeriod = 30 * time.Second
+	kubeletAnchorOrphanGrace     = 2 * kubeletAnchorReconcilePeriod
 	kubeletPodsRoot              = "/var/lib/kubelet/pods"
 	anchorSourcePath             = "/source"
 	anchorTargetRoot             = "/target"
 	sandboxMountRootName         = "mount-root"
 	sandboxMountRootPath         = "/run/csi/mount-root"
+)
+
+var processCSIUnmounts = runtimeclient.ProcessCSIUnmounts
+
+const (
+	kubeletAnchorExposureUnexposed = "unexposed"
+	kubeletAnchorExposurePending   = "pending"
+	kubeletAnchorExposureReady     = "ready"
 )
 
 func candidateSupportsStagedMounts(
@@ -186,13 +197,12 @@ func applyStagedPlacementToNewSandbox(sbx *agentsv1alpha1.Sandbox, opts *config.
 func processKubeletAnchorMounts(
 	ctx context.Context,
 	kubeClient client.Client,
-	apiReader client.Reader,
 	sbx *agentsv1alpha1.Sandbox,
 	opts config.CSIMountOptions,
 ) (time.Duration, error) {
 	start := time.Now()
 	for i := range opts.StagedMountOptionList {
-		if err := mountKubeletAnchor(ctx, kubeClient, apiReader, sbx, &opts.StagedMountOptionList[i].Plan); err != nil {
+		if err := mountKubeletAnchor(ctx, kubeClient, sbx, &opts.StagedMountOptionList[i].Plan); err != nil {
 			return time.Since(start), err
 		}
 	}
@@ -202,19 +212,18 @@ func processKubeletAnchorMounts(
 func mountKubeletAnchor(
 	ctx context.Context,
 	kubeClient client.Client,
-	apiReader client.Reader,
 	sbx *agentsv1alpha1.Sandbox,
 	plan *storages.MountPlan,
 ) error {
 	if plan == nil || plan.Strategy != storages.MountStrategyKubeletAnchor || plan.Anchor == nil {
 		return fmt.Errorf("invalid kubelet-anchor mount plan")
 	}
-	if err := candidateSupportsStagedMounts(ctx, apiReader, sbx, &config.CSIMountOptions{
+	if err := candidateSupportsStagedMounts(ctx, kubeClient, sbx, &config.CSIMountOptions{
 		StagedMountOptionList: []config.StagedMountConfig{{Plan: *plan}},
 	}); err != nil {
 		return fmt.Errorf("sandbox placement does not satisfy staged mount: %w", err)
 	}
-	pod, err := buildKubeletAnchorPod(ctx, apiReader, sbx, plan)
+	pod, err := buildKubeletAnchorPod(ctx, kubeClient, sbx, plan)
 	if err != nil {
 		return err
 	}
@@ -223,7 +232,7 @@ func mountKubeletAnchor(
 			return fmt.Errorf("create kubelet anchor %s/%s: %w", pod.Namespace, pod.Name, err)
 		}
 		existing := &corev1.Pod{}
-		if getErr := apiReader.Get(ctx, client.ObjectKeyFromObject(pod), existing); getErr != nil {
+		if getErr := kubeClient.Get(ctx, client.ObjectKeyFromObject(pod), existing); getErr != nil {
 			return fmt.Errorf("get existing kubelet anchor: %w", getErr)
 		}
 		if err := validateExistingAnchor(existing, pod); err != nil {
@@ -233,14 +242,36 @@ func mountKubeletAnchor(
 
 	waitCtx, cancel := context.WithTimeout(ctx, defaultKubeletAnchorTimeout)
 	defer cancel()
-	if err := waitForKubeletAnchorReady(waitCtx, apiReader, client.ObjectKeyFromObject(pod)); err != nil {
+	if err := waitForKubeletAnchorReady(waitCtx, kubeClient, client.ObjectKeyFromObject(pod)); err != nil {
 		return err
 	}
+	if err := setKubeletAnchorExposureState(ctx, kubeClient, client.ObjectKeyFromObject(pod), kubeletAnchorExposurePending); err != nil {
+		cleanupErr := deleteKubeletAnchor(ctx, kubeClient, sbx, pod.Namespace, pod.Name)
+		return errors.Join(fmt.Errorf("record pending kubelet-anchor exposure: %w", err), cleanupErr)
+	}
 	if err := runtimeclient.ExposeKubeletAnchor(ctx, sbx, plan.VolumeIdentity, plan.Anchor.TargetPath); err != nil {
-		cleanupErr := deleteKubeletAnchor(ctx, kubeClient, apiReader, sbx, pod.Namespace, pod.Name)
+		cleanupErr := deleteKubeletAnchor(ctx, kubeClient, sbx, pod.Namespace, pod.Name)
 		return errors.Join(err, cleanupErr)
 	}
+	if err := setKubeletAnchorExposureState(ctx, kubeClient, client.ObjectKeyFromObject(pod), kubeletAnchorExposureReady); err != nil {
+		cleanupErr := deleteKubeletAnchor(ctx, kubeClient, sbx, pod.Namespace, pod.Name)
+		return errors.Join(fmt.Errorf("record completed kubelet-anchor exposure: %w", err), cleanupErr)
+	}
 	return nil
+}
+
+func setKubeletAnchorExposureState(ctx context.Context, kubeClient client.Client, key client.ObjectKey, state string) error {
+	pod := &corev1.Pod{}
+	if err := kubeClient.Get(ctx, key, pod); err != nil {
+		return err
+	}
+	base := pod.DeepCopy()
+	if pod.Annotations == nil {
+		pod.Annotations = make(map[string]string)
+	}
+	pod.Annotations[KubeletAnchorExposureStateAnno] = state
+	pod.Annotations[KubeletAnchorExposureUpdateAnno] = time.Now().UTC().Format(time.RFC3339Nano)
+	return kubeClient.Patch(ctx, pod, client.MergeFrom(base))
 }
 
 func buildKubeletAnchorPod(
@@ -299,12 +330,14 @@ func buildKubeletAnchorPod(
 				KubeletAnchorSandboxUIDAnno:     string(sbx.UID),
 				KubeletAnchorSandboxPodUIDAnno:  string(sbx.Status.PodInfo.PodUID),
 				KubeletAnchorPVAnnotation:       anchor.PersistentVolumeName,
+				KubeletAnchorExposureStateAnno:  kubeletAnchorExposureUnexposed,
 			},
 			Finalizers: []string{KubeletAnchorFinalizer},
 		},
 		Spec: corev1.PodSpec{
 			NodeName:                      sbx.Status.PodInfo.NodeName,
 			RestartPolicy:                 corev1.RestartPolicyNever,
+			AutomountServiceAccountToken:  ptr.To(false),
 			TerminationGracePeriodSeconds: &grace,
 			Containers: []corev1.Container{{
 				Name:            KubeletAnchorContainerName,
@@ -382,11 +415,10 @@ func waitForKubeletAnchorReady(ctx context.Context, reader client.Reader, key cl
 func cleanupKubeletAnchors(
 	ctx context.Context,
 	kubeClient client.Client,
-	apiReader client.Reader,
 	sbx *agentsv1alpha1.Sandbox,
 ) error {
 	pods := &corev1.PodList{}
-	if err := apiReader.List(ctx, pods, client.MatchingLabels{
+	if err := kubeClient.List(ctx, pods, client.MatchingLabels{
 		KubeletAnchorManagedLabel:     "true",
 		KubeletAnchorSandboxNameLabel: sbx.Name,
 		KubeletAnchorSandboxNSLabel:   sbx.Namespace,
@@ -400,7 +432,7 @@ func cleanupKubeletAnchors(
 		if pod.Annotations[KubeletAnchorSandboxUIDAnno] != string(sbx.UID) {
 			continue
 		}
-		if err := deleteKubeletAnchor(ctx, kubeClient, apiReader, sbx, pod.Namespace, pod.Name); err != nil {
+		if err := deleteKubeletAnchor(ctx, kubeClient, sbx, pod.Namespace, pod.Name); err != nil {
 			errs = append(errs, err)
 		}
 	}
@@ -418,7 +450,6 @@ func sortKubeletAnchorsDeepestFirst(pods []corev1.Pod) {
 func deleteKubeletAnchor(
 	ctx context.Context,
 	kubeClient client.Client,
-	apiReader client.Reader,
 	sbx *agentsv1alpha1.Sandbox,
 	namespace, name string,
 ) error {
@@ -431,7 +462,7 @@ func deleteKubeletAnchor(
 	defer cancel()
 	return wait.PollUntilContextCancel(waitCtx, 500*time.Millisecond, true, func(ctx context.Context) (bool, error) {
 		current := &corev1.Pod{}
-		if err := apiReader.Get(ctx, key, current); err != nil {
+		if err := kubeClient.Get(ctx, key, current); err != nil {
 			if apierrors.IsNotFound(err) {
 				return true, nil
 			}
@@ -448,7 +479,16 @@ func deleteKubeletAnchor(
 		targetPath := current.Annotations[KubeletAnchorTargetAnnotation]
 		if sbx != nil && identity != "" && targetPath != "" &&
 			string(sbx.Status.PodInfo.PodUID) == current.Annotations[KubeletAnchorSandboxPodUIDAnno] {
-			if err := runtimeclient.UnexposeKubeletAnchor(ctx, sbx, identity, targetPath); err != nil {
+			var err error
+			switch current.Annotations[KubeletAnchorExposureStateAnno] {
+			case "", kubeletAnchorExposureReady:
+				// Empty is the backward-compatible state for healthy Anchors
+				// created before exposure state was persisted.
+				err = runtimeclient.UnexposeKubeletAnchor(ctx, sbx, identity, targetPath)
+			case kubeletAnchorExposurePending:
+				err = runtimeclient.DiscardKubeletAnchorExposure(ctx, sbx, identity, targetPath)
+			}
+			if err != nil {
 				return false, err
 			}
 		}
@@ -500,48 +540,142 @@ func (i *Infra) runKubeletAnchorReconciler(ctx context.Context) {
 
 func (i *Infra) reconcileKubeletAnchors(ctx context.Context) error {
 	pods := &corev1.PodList{}
-	if err := i.Cache.GetAPIReader().List(ctx, pods, client.MatchingLabels{KubeletAnchorManagedLabel: "true"}); err != nil {
+	if err := i.Cache.GetClient().List(ctx, pods, client.MatchingLabels{KubeletAnchorManagedLabel: "true"}); err != nil {
+		i.clearAllKubeletAnchorStaleObservations()
 		return fmt.Errorf("list kubelet anchors for reconciliation: %w", err)
 	}
 	sortKubeletAnchorsDeepestFirst(pods.Items)
+	seen := make(map[client.ObjectKey]struct{}, len(pods.Items))
 	var errs []error
 	for idx := range pods.Items {
 		pod := &pods.Items[idx]
+		podKey := client.ObjectKeyFromObject(pod)
+		seen[podKey] = struct{}{}
 		sbx := &agentsv1alpha1.Sandbox{}
 		key := client.ObjectKey{
 			Namespace: pod.Labels[KubeletAnchorSandboxNSLabel],
 			Name:      pod.Labels[KubeletAnchorSandboxNameLabel],
 		}
-		getErr := i.Cache.GetAPIReader().Get(ctx, key, sbx)
+		getErr := i.Cache.GetClient().Get(ctx, key, sbx)
 		validSandbox := getErr == nil && string(sbx.UID) == pod.Annotations[KubeletAnchorSandboxUIDAnno]
 		if getErr != nil && !apierrors.IsNotFound(getErr) {
+			i.clearKubeletAnchorStaleObservation(podKey)
 			errs = append(errs, fmt.Errorf("get sandbox %s for anchor %s/%s: %w", key, pod.Namespace, pod.Name, getErr))
 			continue
 		}
 		claimed := validSandbox && sbx.Labels[agentsv1alpha1.LabelSandboxIsClaimed] == agentsv1alpha1.True
 		currentPod := validSandbox && string(sbx.Status.PodInfo.PodUID) == pod.Annotations[KubeletAnchorSandboxPodUIDAnno]
-		if pod.DeletionTimestamp == nil && claimed && currentPod {
+		now := time.Now()
+		pendingExpired := pendingExposureExpired(pod, now)
+		if pod.DeletionTimestamp == nil && claimed && currentPod && !pendingExpired {
+			i.clearKubeletAnchorStaleObservation(podKey)
+			continue
+		}
+		// A cached Sandbox NotFound, old claim label, Pod UID, or exposure state
+		// can be a transient informer snapshot. Require every non-terminating
+		// Anchor to remain stale across a full grace window before issuing a
+		// destructive delete. Only an already-requested deletion is repaired
+		// immediately.
+		if pod.DeletionTimestamp == nil && !i.confirmKubeletAnchorStale(podKey, now) {
 			continue
 		}
 		var cleanupSandbox *agentsv1alpha1.Sandbox
 		if validSandbox && currentPod {
 			cleanupSandbox = sbx
 		}
-		if err := deleteKubeletAnchor(ctx, i.Cache.GetClient(), i.Cache.GetAPIReader(), cleanupSandbox, pod.Namespace, pod.Name); err != nil {
+		if err := deleteKubeletAnchor(ctx, i.Cache.GetClient(), cleanupSandbox, pod.Namespace, pod.Name); err != nil {
 			errs = append(errs, fmt.Errorf("reconcile kubelet anchor %s/%s: %w", pod.Namespace, pod.Name, err))
+			continue
 		}
+		i.clearKubeletAnchorStaleObservation(podKey)
 	}
+	i.kubeletAnchorStaleObservations.Range(func(key, _ any) bool {
+		if _, ok := seen[key.(client.ObjectKey)]; !ok {
+			i.kubeletAnchorStaleObservations.Delete(key)
+		}
+		return true
+	})
 	return errors.Join(errs...)
+}
+
+func (i *Infra) confirmKubeletAnchorStale(key client.ObjectKey, now time.Time) bool {
+	firstObserved, loaded := i.kubeletAnchorStaleObservations.LoadOrStore(key, now)
+	if !loaded {
+		return false
+	}
+	return !now.Before(firstObserved.(time.Time).Add(kubeletAnchorOrphanGrace))
+}
+
+func (i *Infra) clearKubeletAnchorStaleObservation(key client.ObjectKey) {
+	i.kubeletAnchorStaleObservations.Delete(key)
+}
+
+func (i *Infra) clearAllKubeletAnchorStaleObservations() {
+	i.kubeletAnchorStaleObservations.Range(func(key, _ any) bool {
+		i.kubeletAnchorStaleObservations.Delete(key)
+		return true
+	})
+}
+
+func pendingExposureExpired(pod *corev1.Pod, now time.Time) bool {
+	if pod.Annotations[KubeletAnchorExposureStateAnno] != kubeletAnchorExposurePending {
+		return false
+	}
+	updatedAt, err := time.Parse(time.RFC3339Nano, pod.Annotations[KubeletAnchorExposureUpdateAnno])
+	if err != nil {
+		return true
+	}
+	return !now.Before(updatedAt.Add(defaultKubeletAnchorTimeout))
 }
 
 // CleanupDynamicMounts is the optional infrastructure hook used by the public
 // delete/recycle path. It blocks reuse until every anchor reports a successful
 // unmount and the sandbox-visible symlink is removed.
 func (i *Infra) CleanupDynamicMounts(ctx context.Context, sandbox managerinfra.Sandbox) error {
-	sbx := &agentsv1alpha1.Sandbox{}
-	key := client.ObjectKey{Namespace: sandbox.GetNamespace(), Name: sandbox.GetName()}
-	if err := i.Cache.GetClient().Get(ctx, key, sbx); err != nil {
-		return client.IgnoreNotFound(err)
+	ctx = context.WithoutCancel(ctx)
+	var sbx *agentsv1alpha1.Sandbox
+	if current, ok := sandbox.(*Sandbox); ok && current.Sandbox != nil {
+		// The manager passes the object snapshot it just refreshed before delete.
+		// Prefer it over a potentially older informer observation so a direct
+		// unmount record written by a warm claim cannot be skipped.
+		sbx = current.Sandbox.DeepCopy()
+	} else {
+		sbx = &agentsv1alpha1.Sandbox{}
+		key := client.ObjectKey{Namespace: sandbox.GetNamespace(), Name: sandbox.GetName()}
+		if err := i.Cache.GetClient().Get(ctx, key, sbx); err != nil {
+			return client.IgnoreNotFound(err)
+		}
 	}
-	return cleanupKubeletAnchors(ctx, i.Cache.GetClient(), i.Cache.GetAPIReader(), sbx)
+	var errs []error
+	if err := cleanupKubeletAnchors(ctx, i.Cache.GetClient(), sbx); err != nil {
+		errs = append(errs, err)
+	}
+
+	opts, found, err := runtimeclient.DirectCSIUnmountOptionsFromAnnotation(sbx)
+	if err != nil {
+		errs = append(errs, fmt.Errorf("restore direct CSI unmount identity: %w", err))
+		return errors.Join(errs...)
+	}
+	if !found {
+		// Sandboxes created before direct unmount records were introduced retain
+		// the legacy best-effort path. New Sandboxes never depend on the source PV
+		// still existing at cleanup time.
+		opts, err = runtimeclient.ResolveCSIMountFromAnnotation(ctx, sbx, i.Cache.GetClient(), i.StorageRegistry)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("resolve legacy direct CSI mounts for cleanup: %w", err))
+			return errors.Join(errs...)
+		}
+	}
+	if opts == nil || len(opts.MountOptionList) == 0 {
+		return errors.Join(errs...)
+	}
+	rtOpts, err := runtimeclient.TransportOptionsFor(sbx, i.RuntimeTLSBundle)
+	if err != nil {
+		errs = append(errs, fmt.Errorf("resolve runtime transport for CSI cleanup: %w", err))
+		return errors.Join(errs...)
+	}
+	if _, err := processCSIUnmounts(ctx, sbx, *opts, rtOpts...); err != nil {
+		errs = append(errs, fmt.Errorf("unmount direct CSI volumes: %w", err))
+	}
+	return errors.Join(errs...)
 }

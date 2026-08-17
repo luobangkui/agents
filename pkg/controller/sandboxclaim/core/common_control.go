@@ -456,7 +456,7 @@ func (c *commonControl) buildCSIMountOptions(ctx context.Context, mounts []agent
 		if genErr != nil {
 			errMsg := "failed to generate csi mount options config for sandbox"
 			logger.Error(genErr, errMsg, "mountConfigRequest", mountConfig)
-			return nil, "", "", fmt.Errorf("%s, err: %v", errMsg, genErr)
+			return nil, "", "", fmt.Errorf("%s: %w", errMsg, genErr)
 		}
 		if genErr = opts.AppendMountPlan(plan); genErr != nil {
 			return nil, "", "", genErr
@@ -467,7 +467,7 @@ func (c *commonControl) buildCSIMountOptions(ctx context.Context, mounts []agent
 	csiMountOptionsRaw, err := json.Marshal(mounts)
 	if err != nil {
 		logger.Error(err, "failed to marshal csi mount config")
-		return nil, "", "", fmt.Errorf("failed to marshal csi mount config, err: %v", err)
+		return nil, "", "", fmt.Errorf("failed to marshal csi mount config: %w", err)
 	}
 	opts.MountOptionListRaw = string(csiMountOptionsRaw)
 
@@ -478,7 +478,7 @@ func (c *commonControl) buildCSIMountOptions(ctx context.Context, mounts []agent
 		storageAuthKey, storageAuthValue, err = csiutils.BuildStorageAuthAnnotation(ctx, c.cache.GetClient(), mounts)
 		if err != nil {
 			logger.Error(err, "failed to build storage auth annotation")
-			return nil, "", "", fmt.Errorf("failed to build storage auth annotation: %v", err)
+			return nil, "", "", fmt.Errorf("failed to build storage auth annotation: %w", err)
 		}
 	}
 

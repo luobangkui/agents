@@ -26,7 +26,6 @@ import (
 	"log"
 	"os"
 	"path"
-	"sort"
 	"strings"
 	"time"
 
@@ -37,7 +36,9 @@ import (
 	"github.com/openkruise/agents/pkg/agent-runtime/storage-cli/storage"
 	_ "github.com/openkruise/agents/pkg/agent-runtime/storage-cli/storage/nas"
 	_ "github.com/openkruise/agents/pkg/agent-runtime/storage-cli/storage/oss"
+	"github.com/openkruise/agents/pkg/agent-runtime/storages"
 	"github.com/spf13/cobra"
+	"k8s.io/klog/v2"
 )
 
 var (
@@ -81,6 +82,7 @@ var (
 	storageLookupFn     = storage.Lookup
 	createSymlinkFn     = link.CreateSymlink
 	removeSymlinkFn     = link.RemoveSymlink
+	discardSymlinkFn    = link.DiscardSymlink
 	removeMountTargetFn = removeMountTarget
 	runUnmountFn        = runUnmount
 )
@@ -207,14 +209,22 @@ var unexposeCmd = &cobra.Command{
 	},
 }
 
+var discardExposureCmd = &cobra.Command{
+	Use:   "discard-exposure",
+	Short: "Remove an anchor exposure only when this mount owns it",
+	RunE: func(cmd *cobra.Command, _ []string) error {
+		return runExpose(cmd, true, true)
+	},
+}
+
 func init() {
-	for _, command := range []*cobra.Command{exposeCmd, unexposeCmd} {
+	for _, command := range []*cobra.Command{exposeCmd, unexposeCmd, discardExposureCmd} {
 		command.Flags().StringVar(&anchorID, "identity", "", "stable kubelet-anchor mount identity")
 		command.Flags().StringVar(&anchorPath, "mount-path", "", "user-visible sandbox mount path")
 	}
 }
 
-func runExpose(_ *cobra.Command, remove bool) error {
+func runExpose(_ *cobra.Command, remove bool, discard ...bool) error {
 	if len(anchorID) != sha256.Size*2 {
 		return fmt.Errorf("anchor identity must be a %d-character SHA-256 digest", sha256.Size*2)
 	}
@@ -230,7 +240,11 @@ func runExpose(_ *cobra.Command, remove bool) error {
 	}
 	target := path.Join(mountRootPath, "anchor", anchorID)
 	if remove {
-		if err := removeSymlinkFn(target, anchorPath); err != nil {
+		removeFn := removeSymlinkFn
+		if len(discard) > 0 && discard[0] {
+			removeFn = discardSymlinkFn
+		}
+		if err := removeFn(target, anchorPath); err != nil {
 			return fmt.Errorf("failed to remove anchor symlink %s -> %s: %w", anchorPath, target, err)
 		}
 		return removeMountTargetFn(target)
@@ -243,12 +257,12 @@ func runExpose(_ *cobra.Command, remove bool) error {
 
 func unmountRun(cmd *cobra.Command, args []string) {
 	startTime := time.Now()
-	log.Printf("Received unmount request: driver=%s mountName=%s", driver, mountName)
+	klog.InfoS("received unmount request", "driver", driver, "mountName", mountName)
 	if err := runUnmountFn(cmd); err != nil {
-		log.Printf("Unmount failed (costMs=%d): %v", time.Since(startTime).Milliseconds(), err)
+		klog.ErrorS(err, "unmount failed", "costMs", time.Since(startTime).Milliseconds())
 		os.Exit(1)
 	}
-	log.Printf("Unmount succeeded (costMs=%d)", time.Since(startTime).Milliseconds())
+	klog.InfoS("unmount succeeded", "costMs", time.Since(startTime).Milliseconds())
 }
 
 // runUnmount resolves the same real target as runMount, asks the provider to
@@ -279,7 +293,10 @@ func runUnmount(cmd *cobra.Command) error {
 	}
 
 	originDirectory := csiReq.TargetPath
-	mountTargetHash := getMountTargetHash(driver, csiReq)
+	mountTargetHash, err := storages.DirectUnmountTargetHash(driver, csiReq)
+	if err != nil {
+		return err
+	}
 	mountRootPath, err := mountFinderFn(mountName, debugMode)
 	if err != nil {
 		return fmt.Errorf("failed to find valid mount path for %q: %w", mountName, err)
@@ -287,7 +304,7 @@ func runUnmount(cmd *cobra.Command) error {
 
 	provider, ok := storageLookupFn(driver)
 	if !ok {
-		log.Printf("Supported drivers: %v", storage.Drivers())
+		klog.InfoS("storage driver is unsupported", "driver", driver, "supportedDrivers", storage.Drivers())
 		cmd.Help() // #nosec G104 -- help output error is non-actionable
 		return fmt.Errorf("unsupported storage driver: %s", driver)
 	}
@@ -304,7 +321,12 @@ func runUnmount(cmd *cobra.Command) error {
 	if err := provider.Unmount(unmountCtx, csiReq); err != nil {
 		return fmt.Errorf("unmount failed for driver %s: %w", driver, err)
 	}
-	if err := removeSymlinkFn(toMountTargetPath, originDirectory); err != nil {
+	// NodePublish may have completed before exposing the user path failed, or
+	// the user path may have been replaced since mount. After NodeUnpublish the
+	// host target is released; remove only our owned link and treat missing,
+	// real, or foreign paths as a safe no-op so cleanup always converges without
+	// deleting user data.
+	if err := discardSymlinkFn(toMountTargetPath, originDirectory); err != nil {
 		return fmt.Errorf("failed to remove symlink %s -> %s: %w", originDirectory, toMountTargetPath, err)
 	}
 	if err := removeMountTargetFn(toMountTargetPath); err != nil {
@@ -332,6 +354,7 @@ func main() {
 	rootCmd.AddCommand(unmountCmd) // register unmount subcommand
 	rootCmd.AddCommand(exposeCmd)  // register kubelet-anchor expose subcommand
 	rootCmd.AddCommand(unexposeCmd)
+	rootCmd.AddCommand(discardExposureCmd)
 	rootCmd.AddCommand(versionCmd) // register version subcommand
 
 	// start to execute command line
@@ -359,34 +382,5 @@ func getMD5String(s string) string {
 // /bohr-workspace while changing the OSS path for every session. Hashing only
 // TargetPath would make those sessions share one host FUSE mount.
 func getMountTargetHash(driverName string, req csi.NodePublishVolumeRequest) string {
-	fields := []string{driverName, req.VolumeId, req.TargetPath, fmt.Sprintf("%t", req.Readonly)}
-	keys := make([]string, 0, len(req.VolumeContext))
-	for key := range req.VolumeContext {
-		if isPodIdentityVolumeContextKey(key) {
-			continue
-		}
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	for _, key := range keys {
-		fields = append(fields, key, req.VolumeContext[key])
-	}
-
-	var identity strings.Builder
-	for _, field := range fields {
-		fmt.Fprintf(&identity, "%d:%s;", len(field), field)
-	}
-	return getMD5String(identity.String())
-}
-
-func isPodIdentityVolumeContextKey(key string) bool {
-	switch key {
-	case "csi.storage.k8s.io/pod.name",
-		"csi.storage.k8s.io/pod.namespace",
-		"csi.storage.k8s.io/pod.uid",
-		"csi.storage.k8s.io/serviceAccount.name":
-		return true
-	default:
-		return false
-	}
+	return storages.DirectMountTargetHash(driverName, req)
 }

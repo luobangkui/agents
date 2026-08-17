@@ -31,12 +31,24 @@ import (
 	"github.com/openkruise/agents/pkg/utils/runtime/config"
 )
 
+type dynamicMountCleanupIncompleteError struct {
+	err error
+}
+
+func (e *dynamicMountCleanupIncompleteError) Error() string {
+	return fmt.Sprintf("dynamic mount cleanup remains incomplete: %v", e.err)
+}
+
+func (e *dynamicMountCleanupIncompleteError) Unwrap() error {
+	return e.err
+}
+
 // traceCSIMounts wraps runtime.ProcessCSIMounts in a manager child span that
 // records the volume count and driver list, returning the mount duration and
 // error so each caller (claim, clone) keeps its own metrics reporting and
 // error wrapping. rtOpts is forwarded to the runtime transport so a
 // TLS-capable sandbox mounts its volumes over HTTPS; empty keeps plaintext.
-func traceCSIMounts(ctx context.Context, kubeClient client.Client, apiReader client.Reader, sbx *v1alpha1.Sandbox, opts config.CSIMountOptions, rtOpts ...runtime.Option) (time.Duration, error) {
+func traceCSIMounts(ctx context.Context, kubeClient client.Client, sbx *v1alpha1.Sandbox, opts config.CSIMountOptions, rtOpts ...runtime.Option) (time.Duration, error) {
 	ctx, span := tracing.StartManagerSpan(ctx, tracing.SpanInfraProcessCSIMounts)
 	// Project the mount configs onto the driver-name list accepted by
 	// attribute.StringSlice (which copies the slice internally).
@@ -51,19 +63,29 @@ func traceCSIMounts(ctx context.Context, kubeClient client.Client, apiReader cli
 		attribute.Int(tracing.AttrCSIVolumeCount, len(drivers)),
 		attribute.StringSlice(tracing.AttrCSIDrivers, drivers),
 	)
-	stagedDuration, err := processKubeletAnchorMounts(ctx, kubeClient, apiReader, sbx, opts)
+	stagedDuration, err := processKubeletAnchorMounts(ctx, kubeClient, sbx, opts)
 	if err == nil {
 		var directDuration time.Duration
 		directDuration, err = runtime.ProcessCSIMounts(ctx, sbx, opts, rtOpts...)
 		stagedDuration += directDuration
 	}
-	if err != nil && len(opts.StagedMountOptionList) > 0 {
-		// A claim is atomic from the caller's perspective. If a later staged
-		// volume or a legacy direct mount fails, remove every anchor created for
-		// this Sandbox before its failure path can recycle/delete the object.
-		cleanupErr := cleanupKubeletAnchors(ctx, kubeClient, apiReader, sbx)
-		if cleanupErr != nil {
-			err = errors.Join(err, fmt.Errorf("rollback staged CSI mounts: %w", cleanupErr))
+	if err != nil {
+		// A claim is atomic from the caller's perspective. Direct unpublish is
+		// idempotent, so rolling back the full resolved list safely covers both
+		// successful siblings and the mount that reported the failure.
+		if len(opts.MountOptionList) > 0 {
+			if _, cleanupErr := runtime.ProcessCSIUnmounts(ctx, sbx, opts, rtOpts...); cleanupErr != nil {
+				err = errors.Join(err, &dynamicMountCleanupIncompleteError{
+					err: fmt.Errorf("rollback direct CSI mounts: %w", cleanupErr),
+				})
+			}
+		}
+		if len(opts.StagedMountOptionList) > 0 {
+			if cleanupErr := cleanupKubeletAnchors(ctx, kubeClient, sbx); cleanupErr != nil {
+				err = errors.Join(err, &dynamicMountCleanupIncompleteError{
+					err: fmt.Errorf("rollback staged CSI mounts: %w", cleanupErr),
+				})
+			}
 		}
 	}
 	tracing.EndSpan(ctx, span, err)

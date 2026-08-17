@@ -1,3 +1,5 @@
+//go:build !linux
+
 /*
 Copyright 2026.
 
@@ -14,19 +16,22 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package main
+package kubeletanchormounter
 
-import (
-	"os"
+import "fmt"
 
-	"k8s.io/klog/v2"
+func bindMount(string, string, bool) error {
+	return fmt.Errorf("kubelet anchor mounts require Linux")
+}
 
-	"github.com/openkruise/agents/pkg/agent-runtime/kubeletanchormounter"
-)
+func unmount(string) error {
+	return fmt.Errorf("kubelet anchor unmounts require Linux")
+}
 
-func main() {
-	if err := kubeletanchormounter.Run(os.Args[1:]); err != nil {
-		klog.ErrorS(err, "kubelet-anchor-mounter failed")
-		os.Exit(1)
-	}
+func isMountPoint(string) (bool, error) {
+	return false, fmt.Errorf("mountinfo requires Linux")
+}
+
+func mountMatches(string, string, bool) (bool, error) {
+	return false, fmt.Errorf("mountinfo requires Linux")
 }

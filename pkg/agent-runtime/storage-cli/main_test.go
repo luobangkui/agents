@@ -445,6 +445,7 @@ func withRunMountEnv(t *testing.T, d, cfg, mn string) {
 	origStorageLookupFn := storageLookupFn
 	origCreateSymlinkFn := createSymlinkFn
 	origRemoveSymlinkFn := removeSymlinkFn
+	origDiscardSymlinkFn := discardSymlinkFn
 	origRemoveMountTargetFn := removeMountTargetFn
 	driver, config, mountName = d, cfg, mn
 	mountTimeout = storage.DefaultNodePublishVolumeTimeout
@@ -457,6 +458,7 @@ func withRunMountEnv(t *testing.T, d, cfg, mn string) {
 		storageLookupFn = origStorageLookupFn
 		createSymlinkFn = origCreateSymlinkFn
 		removeSymlinkFn = origRemoveSymlinkFn
+		discardSymlinkFn = origDiscardSymlinkFn
 		removeMountTargetFn = origRemoveMountTargetFn
 	})
 }
@@ -738,7 +740,7 @@ func TestRunUnmountReleasesMountAndOwnedPaths(t *testing.T) {
 			},
 		}, true
 	}
-	removeSymlinkFn = func(target, linkPath string) error {
+	discardSymlinkFn = func(target, linkPath string) error {
 		assert.Equal(t, expectedTarget, target)
 		assert.Equal(t, originTarget, linkPath)
 		steps = append(steps, "remove-symlink")
@@ -771,7 +773,7 @@ func TestRunUnmountStopsCleanupWhenDriverFails(t *testing.T) {
 			},
 		}, true
 	}
-	removeSymlinkFn = func(string, string) error {
+	discardSymlinkFn = func(string, string) error {
 		t.Fatal("symlink cleanup must not run after driver failure")
 		return nil
 	}

@@ -139,3 +139,35 @@ func RemoveSymlink(target, link string) error {
 	}
 	return nil
 }
+
+// DiscardSymlink removes link when it is owned by target and otherwise leaves
+// the path untouched. It is used only for rollback of an exposure whose result
+// was not durably recorded: a missing, real, or foreign path is already safe
+// from the rollback's perspective and must never pin node-side cleanup.
+func DiscardSymlink(target, link string) error {
+	link = strings.TrimRight(link, "/")
+	if link == "" {
+		return fmt.Errorf("link path cannot be empty")
+	}
+	info, err := os.Lstat(link)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("failed to stat link path: %w", err)
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		return nil
+	}
+	existingTarget, err := os.Readlink(link)
+	if err != nil {
+		return fmt.Errorf("failed to read existing symlink: %w", err)
+	}
+	if existingTarget != target {
+		return nil
+	}
+	if err := os.Remove(link); err != nil {
+		return fmt.Errorf("failed to remove symlink %s: %w", link, err)
+	}
+	return nil
+}

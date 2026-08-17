@@ -148,7 +148,7 @@ func Initialize(ctx context.Context, box *agentsv1alpha1.Sandbox, newStatus *age
 		for _, req := range csiMountConfigRequests {
 			plan, genErr := csiMountHandler.GenerateMountPlan(ctx, req)
 			if genErr != nil {
-				return fmt.Errorf("failed to generate csi mount options config for sandbox, err: %v", genErr)
+				return fmt.Errorf("failed to generate csi mount options config for sandbox: %w", genErr)
 			}
 			if genErr = mountOpts.AppendMountPlan(plan); genErr != nil {
 				return genErr

@@ -20,6 +20,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
@@ -33,6 +34,7 @@ import (
 
 	agentsv1alpha1 "github.com/openkruise/agents/api/v1alpha1"
 	"github.com/openkruise/agents/pkg/agent-runtime/storages"
+	runtimeclient "github.com/openkruise/agents/pkg/utils/runtime"
 	runtimeconfig "github.com/openkruise/agents/pkg/utils/runtime/config"
 )
 
@@ -176,8 +178,28 @@ func TestReconcileKubeletAnchorsReapsStalePodIncarnation(t *testing.T) {
 	require.NoError(t, kubeClient.Status().Update(t.Context(), anchor))
 
 	require.NoError(t, infraInstance.reconcileKubeletAnchors(t.Context()))
+	require.NoError(t, kubeClient.Get(t.Context(), client.ObjectKeyFromObject(anchor), &corev1.Pod{}),
+		"the first cache-derived stale observation must not delete an anchor")
+	infraInstance.kubeletAnchorStaleObservations.Store(
+		client.ObjectKeyFromObject(anchor), time.Now().Add(-kubeletAnchorOrphanGrace),
+	)
+	require.NoError(t, infraInstance.reconcileKubeletAnchors(t.Context()))
 	err := kubeClient.Get(t.Context(), client.ObjectKeyFromObject(anchor), &corev1.Pod{})
 	require.True(t, apierrors.IsNotFound(err), "stale anchor should be deleted, got %v", err)
+}
+
+func TestConfirmKubeletAnchorStaleRequiresContinuousGrace(t *testing.T) {
+	infraInstance := &Infra{}
+	key := client.ObjectKey{Namespace: "default", Name: "anchor"}
+	now := time.Now()
+
+	require.False(t, infraInstance.confirmKubeletAnchorStale(key, now))
+	require.False(t, infraInstance.confirmKubeletAnchorStale(key, now.Add(kubeletAnchorOrphanGrace-time.Nanosecond)))
+	require.True(t, infraInstance.confirmKubeletAnchorStale(key, now.Add(kubeletAnchorOrphanGrace)))
+
+	infraInstance.clearKubeletAnchorStaleObservation(key)
+	require.False(t, infraInstance.confirmKubeletAnchorStale(key, now.Add(2*kubeletAnchorOrphanGrace)),
+		"a healthy observation must reset the grace window")
 }
 
 func TestBuildKubeletAnchorPod(t *testing.T) {
@@ -214,7 +236,10 @@ func TestBuildKubeletAnchorPod(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "storage", pod.Namespace)
 	require.Equal(t, "node-a", pod.Spec.NodeName)
+	require.NotNil(t, pod.Spec.AutomountServiceAccountToken)
+	require.False(t, *pod.Spec.AutomountServiceAccountToken)
 	require.Contains(t, pod.Finalizers, KubeletAnchorFinalizer)
+	require.Equal(t, kubeletAnchorExposureUnexposed, pod.Annotations[KubeletAnchorExposureStateAnno])
 	require.Equal(t, "registry.example/anchor:test", pod.Spec.Containers[0].Image)
 	require.Equal(t, "users/42", pod.Spec.Containers[0].VolumeMounts[0].SubPath)
 	require.Equal(t, corev1.MountPropagationBidirectional, *pod.Spec.Containers[0].VolumeMounts[1].MountPropagation)
@@ -228,4 +253,88 @@ func TestBuildKubeletAnchorPod(t *testing.T) {
 	otherPod, err := buildKubeletAnchorPod(context.Background(), kubeClient, otherSandbox, plan)
 	require.NoError(t, err)
 	require.NotEqual(t, pod.Name, otherPod.Name, "concurrent sandboxes sharing an RWX volume need distinct anchor pods")
+}
+
+func TestPendingExposureExpired(t *testing.T) {
+	now := time.Now().UTC()
+	tests := []struct {
+		name        string
+		annotations map[string]string
+		want        bool
+	}{
+		{name: "ready is not pending", annotations: map[string]string{KubeletAnchorExposureStateAnno: kubeletAnchorExposureReady}},
+		{name: "recent pending", annotations: map[string]string{
+			KubeletAnchorExposureStateAnno:  kubeletAnchorExposurePending,
+			KubeletAnchorExposureUpdateAnno: now.Add(-time.Minute).Format(time.RFC3339Nano),
+		}},
+		{name: "expired pending", annotations: map[string]string{
+			KubeletAnchorExposureStateAnno:  kubeletAnchorExposurePending,
+			KubeletAnchorExposureUpdateAnno: now.Add(-defaultKubeletAnchorTimeout).Format(time.RFC3339Nano),
+		}, want: true},
+		{name: "invalid timestamp is repaired", annotations: map[string]string{
+			KubeletAnchorExposureStateAnno:  kubeletAnchorExposurePending,
+			KubeletAnchorExposureUpdateAnno: "invalid",
+		}, want: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Annotations: tt.annotations}}
+			require.Equal(t, tt.want, pendingExposureExpired(pod, now))
+		})
+	}
+}
+
+func TestCleanupDynamicMountsUnmountsDirectProviders(t *testing.T) {
+	infraInstance, kubeClient := NewTestInfra(t)
+	defer infraInstance.Stop(t.Context())
+	const driver = "direct.test.csi.example.com"
+	infraInstance.StorageRegistry.RegisterProvider(driver, &storages.MountProvider{})
+
+	pv := &corev1.PersistentVolume{
+		ObjectMeta: metav1.ObjectMeta{Name: "direct-pv"},
+		Spec: corev1.PersistentVolumeSpec{PersistentVolumeSource: corev1.PersistentVolumeSource{
+			CSI: &corev1.CSIPersistentVolumeSource{
+				Driver:           driver,
+				VolumeHandle:     "stable-volume-handle",
+				VolumeAttributes: map[string]string{"server": "storage.example.com", "path": "/share"},
+			},
+		}},
+	}
+	require.NoError(t, kubeClient.Create(t.Context(), pv))
+	sbx := &agentsv1alpha1.Sandbox{ObjectMeta: metav1.ObjectMeta{
+		Namespace: "default",
+		Name:      "direct-mount-sandbox",
+		UID:       types.UID("sandbox-uid"),
+		Annotations: map[string]string{
+			agentsv1alpha1.AnnotationCSIVolumeConfig: `[{"pvName":"direct-pv","mountPath":"/workspace/data"}]`,
+		},
+	}}
+	resolved, err := runtimeclient.ResolveCSIMountFromAnnotation(
+		t.Context(), sbx, infraInstance.Cache.GetClient(), infraInstance.StorageRegistry,
+	)
+	require.NoError(t, err)
+	expectedHash := storages.DirectMountTargetHash(driver, *resolved.MountOptionList[0].PublishRequest)
+	require.NoError(t, kubeClient.Create(t.Context(), sbx))
+	callerSnapshot := sbx.DeepCopy()
+	require.NoError(t, runtimeclient.RecordDirectCSIUnmounts(callerSnapshot, resolved))
+	require.NoError(t, kubeClient.Delete(t.Context(), pv),
+		"cleanup identity must remain usable after the source PV is deleted")
+
+	originalProcess := processCSIUnmounts
+	t.Cleanup(func() { processCSIUnmounts = originalProcess })
+	called := false
+	processCSIUnmounts = func(_ context.Context, gotSandbox *agentsv1alpha1.Sandbox, opts runtimeconfig.CSIMountOptions, _ ...runtimeclient.Option) (time.Duration, error) {
+		called = true
+		require.Equal(t, sbx.Name, gotSandbox.Name)
+		require.Len(t, opts.MountOptionList, 1)
+		require.Equal(t, driver, opts.MountOptionList[0].Driver)
+		require.Equal(t, "stable-volume-handle", opts.MountOptionList[0].PublishRequest.GetVolumeId())
+		actualHash, hashErr := storages.DirectUnmountTargetHash(driver, *opts.MountOptionList[0].PublishRequest)
+		require.NoError(t, hashErr)
+		require.Equal(t, expectedHash, actualHash)
+		return 0, nil
+	}
+
+	require.NoError(t, infraInstance.CleanupDynamicMounts(t.Context(), AsSandbox(callerSnapshot, infraInstance.Cache)))
+	require.True(t, called, "direct CSI cleanup must reach ProcessCSIUnmounts")
 }

@@ -40,6 +40,31 @@ type CSIMountHandler struct {
 	systemNamespace string
 }
 
+// StorageReadError distinguishes an informer/API dependency failure from an
+// invalid CSI mount request. Callers may classify NotFound as bad input while
+// preserving transient read failures as internal/retriable errors.
+type StorageReadError struct {
+	Resource string
+	Key      ctrlclient.ObjectKey
+	Err      error
+}
+
+func (e *StorageReadError) Error() string {
+	if e.Resource == "persistent volume" {
+		// Preserve the existing external error text while exposing Err through
+		// Unwrap for status classification.
+		return fmt.Sprintf("failed to get persistent volume object by name: %s, err: %v", e.Key.Name, e.Err)
+	}
+	if e.Resource == "node publish secret" {
+		return fmt.Sprintf("failed to get secret object: %s/%s, err: %v", e.Key.Namespace, e.Key.Name, e.Err)
+	}
+	return fmt.Sprintf("failed to get %s object %s: %v", e.Resource, e.Key, e.Err)
+}
+
+func (e *StorageReadError) Unwrap() error {
+	return e.Err
+}
+
 func NewCSIMountHandler(client ctrlclient.Client, apiReader ctrlclient.Reader, storageRegistry storages.VolumeMountProviderRegistry, systemNamespace string) *CSIMountHandler {
 	return &CSIMountHandler{
 		client:          client,
@@ -76,7 +101,11 @@ func (h *CSIMountHandler) GenerateMountPlan(ctx context.Context, mountRequest v1
 	persistentVolumeObj := &corev1.PersistentVolume{}
 	err := h.client.Get(ctx, ctrlclient.ObjectKey{Name: mountRequest.PvName}, persistentVolumeObj)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get persistent volume object by name: %s, err: %v", mountRequest.PvName, err)
+		return nil, &StorageReadError{
+			Resource: "persistent volume",
+			Key:      ctrlclient.ObjectKey{Name: mountRequest.PvName},
+			Err:      err,
+		}
 	}
 	if persistentVolumeObj.Spec.CSI == nil {
 		return nil, fmt.Errorf("no found csi object in persistent volume by name: %s", mountRequest.PvName)
@@ -124,9 +153,10 @@ func (h *CSIMountHandler) GenerateMountPlan(ctx context.Context, mountRequest v1
 			return nil, fmt.Errorf("invalid node publish secret ref namespace: %s, expected: %s", secretNamespace, h.systemNamespace)
 		}
 		secretObj = &corev1.Secret{}
-		err = utils.GetFromInformerOrApiServer(ctx, secretObj, ctrlclient.ObjectKey{Namespace: secretNamespace, Name: nodePublishSecretRef.Name}, h.client, h.apiReader)
+		secretKey := ctrlclient.ObjectKey{Namespace: secretNamespace, Name: nodePublishSecretRef.Name}
+		err = utils.GetFromInformerOrApiServer(ctx, secretObj, secretKey, h.client, h.apiReader)
 		if err != nil {
-			return nil, fmt.Errorf("failed to get secret object: %s/%s, err: %v", secretNamespace, nodePublishSecretRef.Name, err)
+			return nil, &StorageReadError{Resource: "node publish secret", Key: secretKey, Err: err}
 		}
 	}
 
@@ -148,7 +178,7 @@ func (h *CSIMountHandler) GenerateMountPlan(ctx context.Context, mountRequest v1
 		}
 		mergedPath, err := mergeAndValidatePaths(basePath, mountRequest.SubPath)
 		if err != nil {
-			return nil, fmt.Errorf("failed to merge and validate paths: base path=%s, sub path=%s, err: %v", basePath, mountRequest.SubPath, err)
+			return nil, fmt.Errorf("failed to merge and validate paths: base path=%s, sub path=%s: %w", basePath, mountRequest.SubPath, err)
 		}
 		persistentVolumeObj.Spec.CSI.VolumeAttributes["path"] = mergedPath
 	}

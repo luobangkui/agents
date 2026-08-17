@@ -343,7 +343,7 @@ func TestCreateSandbox(t *testing.T) {
 			},
 			setup: func(t *testing.T, controller *Controller, fc ctrlclient.Client) {
 				// Register a test CSI driver in the storage registry
-				controller.storageRegistry.RegisterProvider("test-csi-driver", &storages.MountProvider{})
+				registerRequestStorageProvider(t, controller, "test-csi-driver", &storages.MountProvider{})
 
 				// Create a PersistentVolume with CSI info
 				pv := &corev1.PersistentVolume{
@@ -1460,7 +1460,7 @@ func TestCloneSandbox(t *testing.T) {
 			},
 			setup: func(t *testing.T, controller *Controller, fc ctrlclient.Client) {
 				// Register a test CSI driver in the storage registry
-				controller.storageRegistry.RegisterProvider("test-clone-csi-driver", &storages.MountProvider{})
+				registerRequestStorageProvider(t, controller, "test-clone-csi-driver", &storages.MountProvider{})
 
 				// Create a PersistentVolume with CSI info
 				pv := &corev1.PersistentVolume{

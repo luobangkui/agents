@@ -305,3 +305,29 @@ func TestRemoveSymlink(t *testing.T) {
 		}
 	})
 }
+
+func TestDiscardSymlinkPreservesForeignPaths(t *testing.T) {
+	dir := t.TempDir()
+	expectedTarget := filepath.Join(dir, "expected")
+	tests := []struct {
+		name  string
+		setup func(string) error
+	}{
+		{name: "real directory", setup: func(linkPath string) error { return os.Mkdir(linkPath, 0o755) }},
+		{name: "foreign symlink", setup: func(linkPath string) error { return os.Symlink(filepath.Join(dir, "foreign"), linkPath) }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			linkPath := filepath.Join(dir, strings.ReplaceAll(tt.name, " ", "-"))
+			if err := tt.setup(linkPath); err != nil {
+				t.Fatalf("setup: %v", err)
+			}
+			if err := DiscardSymlink(expectedTarget, linkPath); err != nil {
+				t.Fatalf("DiscardSymlink() error = %v", err)
+			}
+			if _, err := os.Lstat(linkPath); err != nil {
+				t.Fatalf("foreign path was removed: %v", err)
+			}
+		})
+	}
+}

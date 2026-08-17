@@ -28,6 +28,7 @@ import (
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"k8s.io/klog/v2"
 )
 
 // DefaultNodePublishVolumeTimeout is used when the caller does not provide a deadline.
@@ -98,8 +99,10 @@ func RunNodeUnpublishVolume(ctx context.Context, driver string, publishReq csi.N
 		VolumeId:   publishReq.VolumeId,
 		TargetPath: publishReq.TargetPath,
 	}
-	log.Printf("Sending NodeUnpublishVolume request: driver=%s volumeId=%s targetPath=%s",
-		driver, req.VolumeId, req.TargetPath)
+	klog.InfoS("sending NodeUnpublishVolume request",
+		"driver", driver,
+		"volumeID", req.VolumeId,
+		"targetPath", req.TargetPath)
 
 	callCtx := ctx
 	cancel := func() {}
@@ -113,7 +116,10 @@ func RunNodeUnpublishVolume(ctx context.Context, driver string, publishReq csi.N
 	if err != nil {
 		return fmt.Errorf("NodeUnpublishVolume failed for driver %q: %w", driver, err)
 	}
-	log.Printf("NodeUnpublishVolume succeeded: driver=%s resp=%v costMs=%d", driver, resp, time.Since(start).Milliseconds())
+	klog.InfoS("NodeUnpublishVolume succeeded",
+		"driver", driver,
+		"response", resp,
+		"costMs", time.Since(start).Milliseconds())
 	return nil
 }
 

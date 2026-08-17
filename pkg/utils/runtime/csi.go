@@ -38,7 +38,6 @@ import (
 
 	agentsv1alpha1 "github.com/openkruise/agents/api/v1alpha1"
 	"github.com/openkruise/agents/pkg/agent-runtime/storages"
-	"github.com/openkruise/agents/pkg/cache"
 	"github.com/openkruise/agents/pkg/utils"
 	csimountutils "github.com/openkruise/agents/pkg/utils/csiutils"
 	"github.com/openkruise/agents/pkg/utils/logs"
@@ -173,6 +172,13 @@ func ExposeKubeletAnchor(ctx context.Context, sbx *agentsv1alpha1.Sandbox, ident
 // mounter must already have unmounted the propagated bind before this is called.
 func UnexposeKubeletAnchor(ctx context.Context, sbx *agentsv1alpha1.Sandbox, identity, mountPath string) error {
 	return changeKubeletAnchorExposure(ctx, sbx, "unexpose", identity, mountPath)
+}
+
+// DiscardKubeletAnchorExposure is the rollback form of Unexpose. It removes an
+// owned link but treats a missing or foreign path as success because Expose may
+// have failed before ownership was durably recorded.
+func DiscardKubeletAnchorExposure(ctx context.Context, sbx *agentsv1alpha1.Sandbox, identity, mountPath string) error {
+	return changeKubeletAnchorExposure(ctx, sbx, "discard-exposure", identity, mountPath)
 }
 
 func changeKubeletAnchorExposure(ctx context.Context, sbx *agentsv1alpha1.Sandbox, operation, identity, mountPath string) error {
@@ -415,7 +421,7 @@ func GetCsiMountExtensionRequest(s metav1.Object) ([]agentsv1alpha1.CSIMountConf
 
 // ResolveCSIMountFromAnnotation parses CSI mount config from sandbox annotation and resolves it into MountOptionList.
 // Returns nil if no CSI mount annotation is present.
-func ResolveCSIMountFromAnnotation(ctx context.Context, obj metav1.Object, client client.Client, cache cache.Provider, storageRegistry storages.VolumeMountProviderRegistry) (*config.CSIMountOptions, error) {
+func ResolveCSIMountFromAnnotation(ctx context.Context, obj metav1.Object, kubeClient client.Client, storageRegistry storages.VolumeMountProviderRegistry) (*config.CSIMountOptions, error) {
 	log := klog.FromContext(ctx)
 	csiMountConfigs, err := GetCsiMountExtensionRequest(obj)
 	if err != nil {
@@ -425,7 +431,21 @@ func ResolveCSIMountFromAnnotation(ctx context.Context, obj metav1.Object, clien
 	if len(csiMountConfigs) == 0 {
 		return nil, nil
 	}
-	csiClient := csimountutils.NewCSIMountHandler(cache.GetClient(), cache.GetAPIReader(), storageRegistry, utils.DefaultSandboxDeployNamespace)
+	return ResolveCSIMountConfigs(ctx, csiMountConfigs, kubeClient, storageRegistry)
+}
+
+// ResolveCSIMountConfigs converts user CSI intents into provider lifecycle
+// plans inside the infrastructure layer. Both reads use the informer-backed
+// client; callers must not bypass the cache merely because a plan is being
+// built for an on-demand request.
+func ResolveCSIMountConfigs(
+	ctx context.Context,
+	csiMountConfigs []agentsv1alpha1.CSIMountConfig,
+	kubeClient client.Client,
+	storageRegistry storages.VolumeMountProviderRegistry,
+) (*config.CSIMountOptions, error) {
+	log := klog.FromContext(ctx)
+	csiClient := csimountutils.NewCSIMountHandler(kubeClient, kubeClient, storageRegistry, utils.DefaultSandboxDeployNamespace)
 	opts := &config.CSIMountOptions{}
 	for _, cfg := range csiMountConfigs {
 		plan, genErr := csiClient.GenerateMountPlan(ctx, cfg)
@@ -438,4 +458,87 @@ func ResolveCSIMountFromAnnotation(ctx context.Context, obj metav1.Object, clien
 		}
 	}
 	return opts, nil
+}
+
+type directCSIUnmountRecord struct {
+	Driver          string `json:"driver"`
+	VolumeID        string `json:"volumeID"`
+	TargetPath      string `json:"targetPath"`
+	MountTargetHash string `json:"mountTargetHash"`
+}
+
+// RecordDirectCSIUnmounts persists only the identity needed by
+// NodeUnpublishVolume. CSI Secrets, PublishContext, VolumeContext and volume
+// capability are deliberately excluded from the Sandbox annotation.
+func RecordDirectCSIUnmounts(obj metav1.Object, opts *config.CSIMountOptions) error {
+	annotations := obj.GetAnnotations()
+	if annotations == nil {
+		annotations = make(map[string]string)
+	}
+	records := make([]directCSIUnmountRecord, 0)
+	if opts != nil {
+		for _, mount := range opts.MountOptionList {
+			if mount.PublishRequest == nil {
+				return fmt.Errorf("direct unmount record for driver %q has no publish request", mount.Driver)
+			}
+			if strings.TrimSpace(mount.Driver) == "" || strings.TrimSpace(mount.PublishRequest.VolumeId) == "" ||
+				strings.TrimSpace(mount.PublishRequest.TargetPath) == "" {
+				return fmt.Errorf("direct unmount record has incomplete identity")
+			}
+			records = append(records, directCSIUnmountRecord{
+				Driver:          mount.Driver,
+				VolumeID:        mount.PublishRequest.VolumeId,
+				TargetPath:      mount.PublishRequest.TargetPath,
+				MountTargetHash: storages.DirectMountTargetHash(mount.Driver, *mount.PublishRequest),
+			})
+		}
+	}
+	if opts == nil {
+		delete(annotations, agentsv1alpha1.AnnotationCSIDirectUnmountRecords)
+		obj.SetAnnotations(annotations)
+		return nil
+	}
+	raw, err := json.Marshal(records)
+	if err != nil {
+		return fmt.Errorf("marshal direct CSI unmount records: %w", err)
+	}
+	annotations[agentsv1alpha1.AnnotationCSIDirectUnmountRecords] = string(raw)
+	obj.SetAnnotations(annotations)
+	return nil
+}
+
+// DirectCSIUnmountOptionsFromAnnotation restores cleanup requests from the
+// stable, non-secret records captured before mount. found distinguishes a
+// legacy Sandbox (no records) from a Sandbox that intentionally had no direct
+// mounts.
+func DirectCSIUnmountOptionsFromAnnotation(obj metav1.Object) (opts *config.CSIMountOptions, found bool, err error) {
+	raw, found := obj.GetAnnotations()[agentsv1alpha1.AnnotationCSIDirectUnmountRecords]
+	if !found {
+		return nil, false, nil
+	}
+	var records []directCSIUnmountRecord
+	if err := json.Unmarshal([]byte(raw), &records); err != nil {
+		return nil, true, fmt.Errorf("parse direct CSI unmount records: %w", err)
+	}
+	opts = &config.CSIMountOptions{}
+	for _, record := range records {
+		request := &csi.NodePublishVolumeRequest{
+			VolumeId:   record.VolumeID,
+			TargetPath: record.TargetPath,
+			VolumeContext: map[string]string{
+				storages.DirectMountTargetHashContextKey: record.MountTargetHash,
+			},
+		}
+		if record.Driver == "" || record.VolumeID == "" || record.TargetPath == "" {
+			return nil, true, fmt.Errorf("direct CSI unmount record has incomplete identity")
+		}
+		if _, err := storages.DirectUnmountTargetHash(record.Driver, *request); err != nil {
+			return nil, true, err
+		}
+		opts.MountOptionList = append(opts.MountOptionList, config.MountConfig{
+			Driver:         record.Driver,
+			PublishRequest: request,
+		})
+	}
+	return opts, true, nil
 }

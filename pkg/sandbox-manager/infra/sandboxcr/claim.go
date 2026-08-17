@@ -415,10 +415,10 @@ func runClaimPostProcesses(ctx context.Context, sbx *Sandbox, lockType infra.Loc
 		// sandbox-runtime-storage still enforce the configured per-mount
 		// timeout.
 		mountCtx := csiMountContext(ctx)
-		metrics.CSIMount, err = traceCSIMounts(mountCtx, cache.GetClient(), cache.GetAPIReader(), sbx.Sandbox, *opts.CSIMount, rtOpts...)
+		metrics.CSIMount, err = traceCSIMounts(mountCtx, cache.GetClient(), sbx.Sandbox, *opts.CSIMount, rtOpts...)
 		if err != nil {
 			log.Error(err, "failed to perform csi mount")
-			return fmt.Errorf("failed to perform csi mount: %s", err)
+			return fmt.Errorf("failed to perform csi mount: %w", err)
 		}
 		metrics.Total += metrics.CSIMount
 		log.Info("csi mount completed", "cost", metrics.CSIMount)
@@ -441,6 +441,17 @@ func clearFailedSandbox(ctx context.Context, sbx infra.Sandbox, err error, reser
 	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), DefaultCleanupTimeout)
 	defer cancel()
 	log := klog.FromContext(cleanupCtx).WithValues("sandbox", klog.KObj(sbx))
+	var cleanupIncomplete *dynamicMountCleanupIncompleteError
+	if errors.As(err, &cleanupIncomplete) {
+		// Never delete a Sandbox while a host-side mount may still exist. Keep
+		// the CR as the durable owner and preserve its cleanup record so an
+		// operator or a later explicit delete can retry safely.
+		log.Error(cleanupIncomplete, "dynamic mount rollback is incomplete; reserving sandbox until cleanup succeeds")
+		if updateErr := reserveFailedSandbox(cleanupCtx, sbx, timeoututils.Options{}); updateErr != nil {
+			log.Error(updateErr, "failed to mark sandbox with incomplete mount cleanup as reserved")
+		}
+		return
+	}
 
 	if effective < 0 {
 		log.Info("reserving failed sandbox forever for debugging", "reason", err)
@@ -562,7 +573,7 @@ func pickAnAvailableSandbox(ctx context.Context, opts infra.ClaimSandboxOptions,
 			log.Error(checkErr, "skip invalid sandbox", "sandbox", klog.KObj(obj), "resourceVersion", obj.GetResourceVersion())
 			continue
 		}
-		if checkErr := candidateSupportsStagedMounts(ctx, cache.GetAPIReader(), obj, opts.CSIMount); checkErr != nil {
+		if checkErr := candidateSupportsStagedMounts(ctx, cache.GetClient(), obj, opts.CSIMount); checkErr != nil {
 			log.Info("skip sandbox that does not satisfy staged CSI placement", "sandbox", klog.KObj(obj), "reason", checkErr)
 			continue
 		}
@@ -778,6 +789,9 @@ func modifyPickedSandbox(sbx *Sandbox, lockType infra.LockType, opts infra.Claim
 	}
 
 	sbx.SetAnnotations(annotations)
+	if err := runtime.RecordDirectCSIUnmounts(sbx, opts.CSIMount); err != nil {
+		return fmt.Errorf("record direct CSI unmount identity: %w", err)
+	}
 	return nil
 }
 

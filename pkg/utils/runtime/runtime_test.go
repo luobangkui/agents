@@ -395,7 +395,7 @@ func TestResolveCSIMountFromAnnotation_NoAnnotation(t *testing.T) {
 			Annotations: map[string]string{},
 		},
 	}
-	result, err := ResolveCSIMountFromAnnotation(context.Background(), sbx, nil, nil, nil)
+	result, err := ResolveCSIMountFromAnnotation(context.Background(), sbx, nil, nil)
 	assert.NoError(t, err)
 	assert.Nil(t, result)
 }
@@ -410,7 +410,7 @@ func TestResolveCSIMountFromAnnotation_InvalidJSON(t *testing.T) {
 			},
 		},
 	}
-	result, err := ResolveCSIMountFromAnnotation(context.Background(), sbx, nil, nil, nil)
+	result, err := ResolveCSIMountFromAnnotation(context.Background(), sbx, nil, nil)
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "failed to parse csi mount config from annotation")
 	assert.Nil(t, result)

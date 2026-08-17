@@ -1319,38 +1319,17 @@ func TestInjectStorageAuthAnnotation(t *testing.T) {
 	}
 }
 
-// TestBuildCSIMountOptions verifies that buildCSIMountOptions correctly handles
-// empty mount configs, errors from CSI mount config building, and successful
-// CSI mount option construction.
+// TestBuildCSIMountOptions verifies that the API layer carries raw mount intent
+// to sandbox-manager without resolving Kubernetes storage objects itself.
 func TestBuildCSIMountOptions(t *testing.T) {
-	controller, fc, teardown := Setup(t)
+	controller, _, teardown := Setup(t)
 	defer teardown()
-
-	// Register a test CSI driver
-	controller.storageRegistry.RegisterProvider("test-csi-driver", &storages.MountProvider{})
-
-	// Create a PersistentVolume with CSI info
-	pv := &corev1.PersistentVolume{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: "test-build-csi-pv",
-		},
-		Spec: corev1.PersistentVolumeSpec{
-			PersistentVolumeSource: corev1.PersistentVolumeSource{
-				CSI: &corev1.CSIPersistentVolumeSource{
-					Driver:       "test-csi-driver",
-					VolumeHandle: "test-volume-handle",
-				},
-			},
-		},
-	}
-	require.NoError(t, fc.Create(t.Context(), pv))
 
 	tests := []struct {
 		name           string
 		request        models.NewSandboxRequest
-		expectErr      string
 		expectNilMount bool
-		expectDriver   string
+		expectRaw      string
 	}{
 		{
 			name: "no mount configs returns nil",
@@ -1360,31 +1339,14 @@ func TestBuildCSIMountOptions(t *testing.T) {
 			expectNilMount: true,
 		},
 		{
-			name: "pv not found returns error",
+			name: "mount intent is serialized without resolution",
 			request: models.NewSandboxRequest{
 				TemplateID: "test-template",
 				Extensions: models.NewSandboxRequestExtension{
 					CSIMount: models.CSIMountExtension{
 						MountConfigs: []v1alpha1.CSIMountConfig{
 							{
-								PvName:    "non-existent-pv",
-								MountPath: "/mnt/data",
-							},
-						},
-					},
-				},
-			},
-			expectErr: "failed to get persistent volume object by name",
-		},
-		{
-			name: "valid csi mount returns options",
-			request: models.NewSandboxRequest{
-				TemplateID: "test-template",
-				Extensions: models.NewSandboxRequestExtension{
-					CSIMount: models.CSIMountExtension{
-						MountConfigs: []v1alpha1.CSIMountConfig{
-							{
-								PvName:    "test-build-csi-pv",
+								PvName:    "unresolved-pv",
 								MountPath: "/mnt/data",
 							},
 						},
@@ -1392,20 +1354,13 @@ func TestBuildCSIMountOptions(t *testing.T) {
 				},
 			},
 			expectNilMount: false,
-			expectDriver:   "test-csi-driver",
+			expectRaw:      `[{"pvName":"unresolved-pv","mountPath":"/mnt/data"}]`,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			csiMount, err := controller.buildCSIMountOptions(t.Context(), tt.request)
-			if tt.expectErr != "" {
-				require.Error(t, err)
-				assert.Contains(t, err.Error(), tt.expectErr)
-				assert.Nil(t, csiMount)
-				return
-			}
-
 			require.NoError(t, err)
 			if tt.expectNilMount {
 				assert.Nil(t, csiMount)
@@ -1413,11 +1368,9 @@ func TestBuildCSIMountOptions(t *testing.T) {
 			}
 
 			require.NotNil(t, csiMount)
-			require.Len(t, csiMount.MountOptionList, 1)
-			assert.Equal(t, tt.expectDriver, csiMount.MountOptionList[0].Driver)
-			// The resolved mount carries the typed CSI request, not a pre-encoded blob.
-			require.NotNil(t, csiMount.MountOptionList[0].PublishRequest)
-			assert.NotEmpty(t, csiMount.MountOptionList[0].PublishRequest.GetTargetPath())
+			assert.Empty(t, csiMount.MountOptionList)
+			assert.Empty(t, csiMount.StagedMountOptionList)
+			assert.JSONEq(t, tt.expectRaw, csiMount.MountOptionListRaw)
 		})
 	}
 }
@@ -1431,7 +1384,7 @@ func TestCreateSandboxWithClone_StorageAuthHook(t *testing.T) {
 	defer teardown()
 
 	// Register a CSI driver and create a PV
-	controller.storageRegistry.RegisterProvider("test-auth-csi-driver", &storages.MountProvider{})
+	registerRequestStorageProvider(t, controller, "test-auth-csi-driver", &storages.MountProvider{})
 	pv := &corev1.PersistentVolume{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "test-auth-pv",
