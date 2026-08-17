@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"maps"
+	"strings"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	corev1 "k8s.io/api/core/v1"
@@ -39,6 +40,9 @@ func (p *MountProvider) GenerateCSINodePublishVolumeRequest(
 	if persistentVolumeObj.Spec.CSI == nil {
 		return nil, fmt.Errorf("no found csi object in persistent volume")
 	}
+	if strings.TrimSpace(persistentVolumeObj.Spec.CSI.VolumeHandle) == "" {
+		return nil, fmt.Errorf("CSI volume handle is required")
+	}
 	volumeCapability := &csi.VolumeCapability{
 		AccessType: &csi.VolumeCapability_Mount{
 			Mount: &csi.VolumeCapability_MountVolume{
@@ -56,7 +60,7 @@ func (p *MountProvider) GenerateCSINodePublishVolumeRequest(
 		volumeCapability.AccessMode.Mode = csi.VolumeCapability_AccessMode_SINGLE_NODE_READER_ONLY
 	}
 	csiReq := &csi.NodePublishVolumeRequest{
-		VolumeId:         fmt.Sprintf("%v-%s", persistentVolumeObj.Name, generateRandomString(6)),
+		VolumeId:         persistentVolumeObj.Spec.CSI.VolumeHandle,
 		TargetPath:       containerMountTarget, // mount target path in container
 		VolumeCapability: volumeCapability,
 		Readonly:         isReadOnly,

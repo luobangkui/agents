@@ -39,6 +39,7 @@ var AnnotationsClearedOnRecycle = []string{
 	AnnotationCleanup,
 	AnnotationCleanupRetainOnFailure,
 	AnnotationCSIVolumeConfig,
+	AnnotationCSIDirectUnmountRecords,
 	SandboxAnnotationPriority,
 	AnnotationEnvdAccessToken,
 	AnnotationEnvdURL,

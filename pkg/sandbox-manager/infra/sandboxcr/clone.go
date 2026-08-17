@@ -124,6 +124,22 @@ func CloneSandbox(ctx context.Context, opts infra.CloneSandboxOptions, cache inf
 	if err != nil {
 		return nil, metrics, err
 	}
+	// A staged checkpoint mount constrains scheduling just like an explicit
+	// clone request. Resolve restored annotations and apply placement before the
+	// Sandbox exists; waiting until post-ready would strand the clone on an
+	// incompatible mount-service domain.
+	if opts.CSIMount == nil {
+		opts.CSIMount, err = runtime.ResolveCSIMountFromAnnotation(ctx, sbx.Sandbox, cache.GetClient(), sbx.storageRegistry)
+		if err != nil {
+			return nil, metrics, err
+		}
+	}
+	if err = applyStagedPlacementToNewSandbox(sbx.Sandbox, opts.CSIMount); err != nil {
+		return nil, metrics, err
+	}
+	if err = runtime.RecordDirectCSIUnmounts(sbx.Sandbox, opts.CSIMount); err != nil {
+		return nil, metrics, fmt.Errorf("record direct CSI unmount identity: %w", err)
+	}
 	if opts.Admission != nil && opts.Admission.Acquire != nil {
 		if err = opts.Admission.Acquire(ctx, opts.LockString, sbx.GetResource()); err != nil {
 			log.Error(err, "failed to acquire sandbox admission", "lockString", opts.LockString)
@@ -226,23 +242,15 @@ func CloneSandbox(ctx context.Context, opts infra.CloneSandboxOptions, cache inf
 		sbx.trafficToken = accessResp
 	}
 
-	// Step 8: csi mount
-	// If opts.CSIMount is not provided from request, try to resolve mount options from sandbox annotation.
-	if opts.CSIMount == nil {
-		var resolveErr error
-		opts.CSIMount, resolveErr = runtime.ResolveCSIMountFromAnnotation(ctx, sbx.Sandbox, sbx.Cache.GetClient(), sbx.Cache, sbx.storageRegistry)
-		if resolveErr != nil {
-			err = resolveErr
-			return
-		}
-	}
+	// Step 8: csi mount. Restored annotations were resolved before creation so
+	// staged placement and execution use the same immutable plan.
 	if opts.CSIMount != nil {
 		log.Info("starting to perform csi mount")
-		metrics.CSIMount, err = traceCSIMounts(ctx, sbx.Sandbox, *opts.CSIMount, rtOpts...)
+		metrics.CSIMount, err = traceCSIMounts(ctx, sbx.Cache.GetClient(), sbx.Sandbox, *opts.CSIMount, rtOpts...)
 		metrics.Total += metrics.CSIMount
 		if err != nil {
 			log.Error(err, "failed to perform csi mount")
-			err = fmt.Errorf("failed to perform csi mount: %s", err)
+			err = fmt.Errorf("failed to perform csi mount: %w", err)
 			return
 		}
 		log.Info("csi mount completed", "cost", metrics.CSIMount)

@@ -28,6 +28,7 @@ import (
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"k8s.io/klog/v2"
 )
 
 // DefaultNodePublishVolumeTimeout is used when the caller does not provide a deadline.
@@ -80,6 +81,45 @@ func RunNodePublishVolume(ctx context.Context, driver string, req csi.NodePublis
 		return fmt.Errorf("NodePublishVolume failed for driver %q: %w", driver, err)
 	}
 	log.Printf("NodePublishVolume succeeded: driver=%s resp=%v costMs=%d", driver, resp, time.Since(start).Milliseconds())
+	return nil
+}
+
+// RunNodeUnpublishVolume dials the CSI plugin socket for the given driver and
+// releases the target created by RunNodePublishVolume. CSI defines unpublish as
+// idempotent, so callers may safely retry this operation after partial cleanup.
+func RunNodeUnpublishVolume(ctx context.Context, driver string, publishReq csi.NodePublishVolumeRequest) error {
+	socketPath := path.Join(CsiSocketDir, driver, CsiSocketFile)
+	client, closer, err := newClientFn(socketPath)
+	if err != nil {
+		return fmt.Errorf("create CSI client for driver %q: %w", driver, err)
+	}
+	defer closer.Close()
+
+	req := &csi.NodeUnpublishVolumeRequest{
+		VolumeId:   publishReq.VolumeId,
+		TargetPath: publishReq.TargetPath,
+	}
+	klog.InfoS("sending NodeUnpublishVolume request",
+		"driver", driver,
+		"volumeID", req.VolumeId,
+		"targetPath", req.TargetPath)
+
+	callCtx := ctx
+	cancel := func() {}
+	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+		callCtx, cancel = context.WithTimeout(ctx, DefaultNodePublishVolumeTimeout)
+	}
+	defer cancel()
+
+	start := time.Now()
+	resp, err := client.NodeUnpublishVolume(callCtx, req, grpc.WaitForReady(true))
+	if err != nil {
+		return fmt.Errorf("NodeUnpublishVolume failed for driver %q: %w", driver, err)
+	}
+	klog.InfoS("NodeUnpublishVolume succeeded",
+		"driver", driver,
+		"response", resp,
+		"costMs", time.Since(start).Milliseconds())
 	return nil
 }
 

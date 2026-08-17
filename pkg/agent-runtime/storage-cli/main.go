@@ -19,12 +19,13 @@ package main
 import (
 	"context"
 	"crypto/md5" // #nosec G501 -- non-security short hash
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"fmt"
 	"log"
 	"os"
 	"path"
-	"sort"
 	"strings"
 	"time"
 
@@ -35,7 +36,9 @@ import (
 	"github.com/openkruise/agents/pkg/agent-runtime/storage-cli/storage"
 	_ "github.com/openkruise/agents/pkg/agent-runtime/storage-cli/storage/nas"
 	_ "github.com/openkruise/agents/pkg/agent-runtime/storage-cli/storage/oss"
+	"github.com/openkruise/agents/pkg/agent-runtime/storages"
 	"github.com/spf13/cobra"
+	"k8s.io/klog/v2"
 )
 
 var (
@@ -44,6 +47,8 @@ var (
 	mountName    string // name of the shared mount-root volume; defaults to "mount-root"
 	debugMode    bool   // when true, sensitive fields such as PublishContext are included in log output
 	mountTimeout time.Duration
+	anchorID     string
+	anchorPath   string
 )
 
 func init() {
@@ -73,9 +78,13 @@ var mountCmd = &cobra.Command{
 // Tests in the same package may replace these to inject fakes;
 // production code MUST NOT reassign them.
 var (
-	mountFinderFn   = mountfinder.FindMountPath
-	storageLookupFn = storage.Lookup
-	createSymlinkFn = link.CreateSymlink
+	mountFinderFn       = mountfinder.FindMountPath
+	storageLookupFn     = storage.Lookup
+	createSymlinkFn     = link.CreateSymlink
+	removeSymlinkFn     = link.RemoveSymlink
+	discardSymlinkFn    = link.DiscardSymlink
+	removeMountTargetFn = removeMountTarget
+	runUnmountFn        = runUnmount
 )
 
 func rootRun(cmd *cobra.Command, args []string) {
@@ -184,14 +193,157 @@ var unmountCmd = &cobra.Command{
 	Run:   unmountRun,
 }
 
-func unmountRun(cmd *cobra.Command, args []string) {
-	err := validateUnmountParams() // unmount uses the same parameter validation
-	if err != nil {
-		log.Printf("Error: %v\n", err)
-		cmd.Help() // #nosec G104 -- help output error is non-actionable
-		return
+var exposeCmd = &cobra.Command{
+	Use:   "expose",
+	Short: "Expose an already-mounted kubelet anchor at a sandbox path",
+	RunE: func(cmd *cobra.Command, _ []string) error {
+		return runExpose(cmd, false)
+	},
+}
+
+var unexposeCmd = &cobra.Command{
+	Use:   "unexpose",
+	Short: "Remove a sandbox path owned by a kubelet anchor",
+	RunE: func(cmd *cobra.Command, _ []string) error {
+		return runExpose(cmd, true)
+	},
+}
+
+var discardExposureCmd = &cobra.Command{
+	Use:   "discard-exposure",
+	Short: "Remove an anchor exposure only when this mount owns it",
+	RunE: func(cmd *cobra.Command, _ []string) error {
+		return runExpose(cmd, true, true)
+	},
+}
+
+func init() {
+	for _, command := range []*cobra.Command{exposeCmd, unexposeCmd, discardExposureCmd} {
+		command.Flags().StringVar(&anchorID, "identity", "", "stable kubelet-anchor mount identity")
+		command.Flags().StringVar(&anchorPath, "mount-path", "", "user-visible sandbox mount path")
 	}
-	// TODO
+}
+
+func runExpose(_ *cobra.Command, remove bool, discard ...bool) error {
+	if len(anchorID) != sha256.Size*2 {
+		return fmt.Errorf("anchor identity must be a %d-character SHA-256 digest", sha256.Size*2)
+	}
+	if _, err := hex.DecodeString(anchorID); err != nil {
+		return fmt.Errorf("anchor identity is not hexadecimal: %w", err)
+	}
+	if strings.TrimSpace(anchorPath) == "" || !path.IsAbs(anchorPath) {
+		return fmt.Errorf("anchor mount path must be absolute")
+	}
+	mountRootPath, err := mountFinderFn(mountName, debugMode)
+	if err != nil {
+		return fmt.Errorf("failed to find valid mount path for %q: %w", mountName, err)
+	}
+	target := path.Join(mountRootPath, "anchor", anchorID)
+	if remove {
+		removeFn := removeSymlinkFn
+		if len(discard) > 0 && discard[0] {
+			removeFn = discardSymlinkFn
+		}
+		if err := removeFn(target, anchorPath); err != nil {
+			return fmt.Errorf("failed to remove anchor symlink %s -> %s: %w", anchorPath, target, err)
+		}
+		return removeMountTargetFn(target)
+	}
+	if err := createSymlinkFn(target, anchorPath); err != nil {
+		return fmt.Errorf("failed to create anchor symlink %s -> %s: %w", anchorPath, target, err)
+	}
+	return nil
+}
+
+func unmountRun(cmd *cobra.Command, args []string) {
+	startTime := time.Now()
+	klog.InfoS("received unmount request", "driver", driver, "mountName", mountName)
+	if err := runUnmountFn(cmd); err != nil {
+		klog.ErrorS(err, "unmount failed", "costMs", time.Since(startTime).Milliseconds())
+		os.Exit(1)
+	}
+	klog.InfoS("unmount succeeded", "costMs", time.Since(startTime).Milliseconds())
+}
+
+// runUnmount resolves the same real target as runMount, asks the provider to
+// release it, and then removes only paths owned by this CLI. Cleanup is ordered
+// deliberately: a failed driver unmount must leave the user-visible symlink in
+// place so the mount can be retried without losing its identity.
+func runUnmount(cmd *cobra.Command) error {
+	if mountTimeout <= 0 {
+		return fmt.Errorf("mount timeout must be greater than 0")
+	}
+
+	configRaw, err := base64.StdEncoding.DecodeString(config)
+	if err != nil {
+		cmd.Help() // #nosec G104 -- help output error is non-actionable
+		return fmt.Errorf("failed to decode CSI request config: %w", err)
+	}
+
+	csiReq := csi.NodePublishVolumeRequest{}
+	if err := proto.Unmarshal(configRaw, &csiReq); err != nil {
+		cmd.Help() // #nosec G104 -- help output error is non-actionable
+		return fmt.Errorf("failed to unmarshal CSI request: %w", err)
+	}
+	if strings.TrimSpace(csiReq.VolumeId) == "" {
+		return fmt.Errorf("volume ID is required for unmount")
+	}
+	if strings.TrimSpace(csiReq.TargetPath) == "" {
+		return fmt.Errorf("target path is required for unmount")
+	}
+
+	originDirectory := csiReq.TargetPath
+	mountTargetHash, err := storages.DirectUnmountTargetHash(driver, csiReq)
+	if err != nil {
+		return err
+	}
+	mountRootPath, err := mountFinderFn(mountName, debugMode)
+	if err != nil {
+		return fmt.Errorf("failed to find valid mount path for %q: %w", mountName, err)
+	}
+
+	provider, ok := storageLookupFn(driver)
+	if !ok {
+		klog.InfoS("storage driver is unsupported", "driver", driver, "supportedDrivers", storage.Drivers())
+		cmd.Help() // #nosec G104 -- help output error is non-actionable
+		return fmt.Errorf("unsupported storage driver: %s", driver)
+	}
+
+	toMountTargetPath := path.Join(mountRootPath, provider.SubDir(), mountTargetHash)
+	csiReq.TargetPath = toMountTargetPath
+
+	parentCtx := cmd.Context()
+	if parentCtx == nil {
+		parentCtx = context.Background()
+	}
+	unmountCtx, cancel := context.WithTimeout(parentCtx, mountTimeout)
+	defer cancel()
+	if err := provider.Unmount(unmountCtx, csiReq); err != nil {
+		return fmt.Errorf("unmount failed for driver %s: %w", driver, err)
+	}
+	// NodePublish may have completed before exposing the user path failed, or
+	// the user path may have been replaced since mount. After NodeUnpublish the
+	// host target is released; remove only our owned link and treat missing,
+	// real, or foreign paths as a safe no-op so cleanup always converges without
+	// deleting user data.
+	if err := discardSymlinkFn(toMountTargetPath, originDirectory); err != nil {
+		return fmt.Errorf("failed to remove symlink %s -> %s: %w", originDirectory, toMountTargetPath, err)
+	}
+	if err := removeMountTargetFn(toMountTargetPath); err != nil {
+		return err
+	}
+	return nil
+}
+
+func removeMountTarget(target string) error {
+	err := os.Remove(target)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("failed to remove mount target %s: %w", target, err)
+	}
+	return nil
 }
 
 func main() {
@@ -200,6 +352,9 @@ func main() {
 	// add sub command line
 	rootCmd.AddCommand(mountCmd)   // register mount subcommand
 	rootCmd.AddCommand(unmountCmd) // register unmount subcommand
+	rootCmd.AddCommand(exposeCmd)  // register kubelet-anchor expose subcommand
+	rootCmd.AddCommand(unexposeCmd)
+	rootCmd.AddCommand(discardExposureCmd)
 	rootCmd.AddCommand(versionCmd) // register version subcommand
 
 	// start to execute command line
@@ -216,10 +371,6 @@ func validateGeneralParams(csiReq csi.NodePublishVolumeRequest) error {
 	return nil
 }
 
-func validateUnmountParams() error {
-	return nil
-}
-
 func getMD5String(s string) string {
 	h := md5.New()     // #nosec G401 -- non-security short hash
 	h.Write([]byte(s)) // #nosec G104 -- hash.Write never returns error
@@ -231,34 +382,5 @@ func getMD5String(s string) string {
 // /bohr-workspace while changing the OSS path for every session. Hashing only
 // TargetPath would make those sessions share one host FUSE mount.
 func getMountTargetHash(driverName string, req csi.NodePublishVolumeRequest) string {
-	fields := []string{driverName, req.VolumeId, req.TargetPath, fmt.Sprintf("%t", req.Readonly)}
-	keys := make([]string, 0, len(req.VolumeContext))
-	for key := range req.VolumeContext {
-		if isPodIdentityVolumeContextKey(key) {
-			continue
-		}
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	for _, key := range keys {
-		fields = append(fields, key, req.VolumeContext[key])
-	}
-
-	var identity strings.Builder
-	for _, field := range fields {
-		fmt.Fprintf(&identity, "%d:%s;", len(field), field)
-	}
-	return getMD5String(identity.String())
-}
-
-func isPodIdentityVolumeContextKey(key string) bool {
-	switch key {
-	case "csi.storage.k8s.io/pod.name",
-		"csi.storage.k8s.io/pod.namespace",
-		"csi.storage.k8s.io/pod.uid",
-		"csi.storage.k8s.io/serviceAccount.name":
-		return true
-	default:
-		return false
-	}
+	return storages.DirectMountTargetHash(driverName, req)
 }

@@ -31,14 +31,17 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/openkruise/agents/api/v1alpha1"
+	"github.com/openkruise/agents/pkg/agent-runtime/storages"
 	"github.com/openkruise/agents/pkg/cache"
 	"github.com/openkruise/agents/pkg/sandbox-manager/config"
 	managererrors "github.com/openkruise/agents/pkg/sandbox-manager/errors"
 	"github.com/openkruise/agents/pkg/sandbox-manager/infra"
 	"github.com/openkruise/agents/pkg/sandboxid"
 	"github.com/openkruise/agents/pkg/utils"
+	"github.com/openkruise/agents/pkg/utils/csiutils"
 	"github.com/openkruise/agents/pkg/utils/expectations"
 	"github.com/openkruise/agents/pkg/utils/runtime"
+	runtimeconfig "github.com/openkruise/agents/pkg/utils/runtime/config"
 )
 
 var DefaultDeleteSandboxTemplate = deleteSandboxTemplate
@@ -64,6 +67,7 @@ func NewInfraBuilder(opts config.SandboxManagerOptions) *InfraBuilder {
 		instance: &Infra{
 			claimLockChannel: make(chan struct{}, opts.MaxClaimWorkers),
 			createLimiter:    rate.NewLimiter(rate.Limit(opts.MaxCreateQPS), opts.MaxCreateQPS),
+			StorageRegistry:  storages.NewStorageProvider(),
 		},
 	}
 }
@@ -104,15 +108,53 @@ type Infra struct {
 	// agent-runtimes; nil disables runtime TLS for this manager, so every
 	// sandbox is served over the legacy plaintext paths.
 	RuntimeTLSBundle *runtime.TLSBundle
+	// StorageRegistry resolves cloud-specific direct and staged lifecycle plans.
+	StorageRegistry storages.VolumeMountProviderRegistry
 
 	// For claiming sandbox
-	pickCache        sync.Map
-	claimLockChannel chan struct{}
-	createLimiter    *rate.Limiter
+	pickCache sync.Map
+	// kubeletAnchorStaleObservations requires a stale cache-derived condition
+	// to persist across reconciles before an Anchor Pod may be deleted.
+	kubeletAnchorStaleObservations sync.Map
+	claimLockChannel               chan struct{}
+	createLimiter                  *rate.Limiter
+}
+
+func (i *Infra) resolveRawCSIMountOptions(ctx context.Context, opts *runtimeconfig.CSIMountOptions) error {
+	if opts == nil || opts.MountOptionListRaw == "" ||
+		len(opts.MountOptionList) > 0 || len(opts.StagedMountOptionList) > 0 {
+		return nil
+	}
+	var mounts []v1alpha1.CSIMountConfig
+	if err := json.Unmarshal([]byte(opts.MountOptionListRaw), &mounts); err != nil {
+		return fmt.Errorf("parse CSI mount configs: %w", err)
+	}
+	resolved, err := runtime.ResolveCSIMountConfigs(ctx, mounts, i.Cache.GetClient(), i.StorageRegistry)
+	if err != nil {
+		return err
+	}
+	resolved.MountOptionListRaw = opts.MountOptionListRaw
+	resolved.Concurrency = opts.Concurrency
+	resolved.Timeout = opts.Timeout
+	*opts = *resolved
+	return nil
+}
+
+func classifyCSIMountResolveError(err error) error {
+	code := managererrors.ErrorBadRequest
+	var readErr *csiutils.StorageReadError
+	if errors.As(err, &readErr) && !apierrors.IsNotFound(err) {
+		code = managererrors.ErrorInternal
+	}
+	return managererrors.WrapError(code, err, "failed to resolve CSI mount options: %v", err)
 }
 
 func (i *Infra) Run(ctx context.Context) error {
-	return i.Cache.Run(ctx)
+	if err := i.Cache.Run(ctx); err != nil {
+		return err
+	}
+	go i.runKubeletAnchorReconciler(ctx)
+	return nil
 }
 
 func (i *Infra) Stop(ctx context.Context) {
@@ -140,6 +182,10 @@ func (i *Infra) ClaimSandbox(ctx context.Context, opts infra.ClaimSandboxOptions
 	if err != nil {
 		log.Error(err, "invalid claim options")
 		return nil, metrics, err
+	}
+	if err := i.resolveRawCSIMountOptions(ctx, opts.CSIMount); err != nil {
+		log.Error(err, "failed to resolve CSI mount options")
+		return nil, metrics, classifyCSIMountResolveError(err)
 	}
 	// Overwrite with the Infra-owned runtime TLS bundle so claim
 	// post-processing can resolve the per-sandbox transport; the field is
@@ -229,6 +275,10 @@ func (i *Infra) CloneSandbox(ctx context.Context, opts infra.CloneSandboxOptions
 	if err != nil {
 		log.Error(err, "invalid clone options")
 		return nil, metrics, err
+	}
+	if err := i.resolveRawCSIMountOptions(ctx, opts.CSIMount); err != nil {
+		log.Error(err, "failed to resolve CSI mount options")
+		return nil, metrics, classifyCSIMountResolveError(err)
 	}
 	log.V(utils.DebugLogLevel).Info("clone sandbox options", "options", opts)
 

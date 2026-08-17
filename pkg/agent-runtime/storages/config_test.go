@@ -22,6 +22,7 @@ import (
 	"testing"
 
 	"github.com/openkruise/agents/pkg/agent-runtime/common"
+	"github.com/stretchr/testify/require"
 )
 
 // TestInitFunction tests the package initialization logic with environment variable
@@ -87,6 +88,41 @@ func TestInitFunction(t *testing.T) {
 	// Should have 1 element because Split("") returns [""]
 	if len(emptyTempFuncs) != 0 { // After trimming empty string
 		t.Errorf("Expected 0 provider functions for empty env var, got %d", len(emptyTempFuncs))
+	}
+}
+
+func TestNewProviderForDriverSelectsLifecycleCapability(t *testing.T) {
+	tests := []struct {
+		name   string
+		driver string
+		assert func(*testing.T, VolumeMountProvider)
+	}{
+		{
+			name:   "VEPFS uses staged provider",
+			driver: VEPFSCSIDriverName,
+			assert: func(t *testing.T, provider VolumeMountProvider) {
+				_, ok := provider.(*VEPFSMountProvider)
+				require.True(t, ok)
+				_, ok = provider.(StagedVolumeMountProvider)
+				require.True(t, ok)
+			},
+		},
+		{
+			name:   "other driver keeps direct provider",
+			driver: "nasplugin.csi.alibabacloud.com",
+			assert: func(t *testing.T, provider VolumeMountProvider) {
+				_, ok := provider.(*MountProvider)
+				require.True(t, ok)
+				_, staged := provider.(StagedVolumeMountProvider)
+				require.False(t, staged)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.assert(t, newProviderForDriver(tt.driver))
+		})
 	}
 }
 

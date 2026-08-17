@@ -40,6 +40,31 @@ type CSIMountHandler struct {
 	systemNamespace string
 }
 
+// StorageReadError distinguishes an informer/API dependency failure from an
+// invalid CSI mount request. Callers may classify NotFound as bad input while
+// preserving transient read failures as internal/retriable errors.
+type StorageReadError struct {
+	Resource string
+	Key      ctrlclient.ObjectKey
+	Err      error
+}
+
+func (e *StorageReadError) Error() string {
+	if e.Resource == "persistent volume" {
+		// Preserve the existing external error text while exposing Err through
+		// Unwrap for status classification.
+		return fmt.Sprintf("failed to get persistent volume object by name: %s, err: %v", e.Key.Name, e.Err)
+	}
+	if e.Resource == "node publish secret" {
+		return fmt.Sprintf("failed to get secret object: %s/%s, err: %v", e.Key.Namespace, e.Key.Name, e.Err)
+	}
+	return fmt.Sprintf("failed to get %s object %s: %v", e.Resource, e.Key, e.Err)
+}
+
+func (e *StorageReadError) Unwrap() error {
+	return e.Err
+}
+
 func NewCSIMountHandler(client ctrlclient.Client, apiReader ctrlclient.Reader, storageRegistry storages.VolumeMountProviderRegistry, systemNamespace string) *CSIMountHandler {
 	return &CSIMountHandler{
 		client:          client,
@@ -50,30 +75,68 @@ func NewCSIMountHandler(client ctrlclient.Client, apiReader ctrlclient.Reader, s
 }
 
 func (h *CSIMountHandler) GenerateNodePublishVolumeRequest(ctx context.Context, mountRequest v1alpha1.CSIMountConfig) (string, *csi.NodePublishVolumeRequest, error) {
+	plan, err := h.GenerateMountPlan(ctx, mountRequest)
+	if err != nil {
+		return "", nil, err
+	}
+	if plan.Strategy != storages.MountStrategyDirectNodePublish || plan.PublishRequest == nil {
+		return "", nil, fmt.Errorf("driver %s requires lifecycle strategy %s and cannot be represented by NodePublishVolumeRequest",
+			plan.Driver, plan.Strategy)
+	}
+	return plan.Driver, plan.PublishRequest, nil
+}
+
+// GenerateMountPlan resolves a user CSI mount request into either the legacy
+// direct-publish request or a staged lifecycle plan. Staged providers are
+// detected before NodePublish Secret lookup and sub-path rewriting because
+// Kubernetes owns those inputs for an anchor volume.
+func (h *CSIMountHandler) GenerateMountPlan(ctx context.Context, mountRequest v1alpha1.CSIMountConfig) (*storages.MountPlan, error) {
 	log := klog.FromContext(ctx)
 	startTime := time.Now()
 	if mountRequest.PvName == "" {
-		return "", nil, fmt.Errorf("no found persistent volume name")
+		return nil, fmt.Errorf("no found persistent volume name")
 	}
 	// There are potential scenarios, such as incomplete cache synchronization,
 	// where implementing a resilience or fault-tolerance mechanism can help mitigate spurious errors and improve system robustness.
 	persistentVolumeObj := &corev1.PersistentVolume{}
 	err := h.client.Get(ctx, ctrlclient.ObjectKey{Name: mountRequest.PvName}, persistentVolumeObj)
 	if err != nil {
-		return "", nil, fmt.Errorf("failed to get persistent volume object by name: %s, err: %v", mountRequest.PvName, err)
+		return nil, &StorageReadError{
+			Resource: "persistent volume",
+			Key:      ctrlclient.ObjectKey{Name: mountRequest.PvName},
+			Err:      err,
+		}
 	}
 	if persistentVolumeObj.Spec.CSI == nil {
-		return "", nil, fmt.Errorf("no found csi object in persistent volume by name: %s", mountRequest.PvName)
+		return nil, fmt.Errorf("no found csi object in persistent volume by name: %s", mountRequest.PvName)
 	}
 	driverName := persistentVolumeObj.Spec.CSI.Driver
 	if !h.storageRegistry.IsSupported(driverName) {
-		return "", nil, fmt.Errorf("driver %s is not supported in current environment", driverName)
+		return nil, fmt.Errorf("driver %s is not supported in current environment", driverName)
 	}
 
 	// to fetch storage provider
 	storageProvider, exists := h.storageRegistry.GetProvider(driverName)
 	if !exists {
-		return "", nil, fmt.Errorf("no provider found for driver: %s", driverName)
+		return nil, fmt.Errorf("no provider found for driver: %s", driverName)
+	}
+
+	if stagedProvider, ok := storageProvider.(storages.StagedVolumeMountProvider); ok {
+		plan, err := stagedProvider.GenerateStagedCSIMountPlan(
+			ctx,
+			storages.StagedMountInput{
+				TargetPath:       mountRequest.MountPath,
+				SubPath:          mountRequest.SubPath,
+				PersistentVolume: persistentVolumeObj.DeepCopy(),
+				ReadOnly:         mountRequest.ReadOnly,
+			},
+		)
+		if err != nil {
+			return nil, fmt.Errorf("failed to resolve staged CSI lifecycle for driver %s: %w", driverName, err)
+		}
+		log.Info("generated staged CSI mount plan for sandbox",
+			"driver", driverName, "strategy", plan.Strategy, "mountCost", time.Since(startTime))
+		return plan, nil
 	}
 
 	// to fetch secret object
@@ -87,12 +150,13 @@ func (h *CSIMountHandler) GenerateNodePublishVolumeRequest(ctx context.Context, 
 		if secretNamespace == "" {
 			secretNamespace = utils.DefaultSandboxDeployNamespace
 		} else if secretNamespace != h.systemNamespace {
-			return "", nil, fmt.Errorf("invalid node publish secret ref namespace: %s, expected: %s", secretNamespace, h.systemNamespace)
+			return nil, fmt.Errorf("invalid node publish secret ref namespace: %s, expected: %s", secretNamespace, h.systemNamespace)
 		}
 		secretObj = &corev1.Secret{}
-		err = utils.GetFromInformerOrApiServer(ctx, secretObj, ctrlclient.ObjectKey{Namespace: secretNamespace, Name: nodePublishSecretRef.Name}, h.client, h.apiReader)
+		secretKey := ctrlclient.ObjectKey{Namespace: secretNamespace, Name: nodePublishSecretRef.Name}
+		err = utils.GetFromInformerOrApiServer(ctx, secretObj, secretKey, h.client, h.apiReader)
 		if err != nil {
-			return "", nil, fmt.Errorf("failed to get secret object: %s/%s, err: %v", secretNamespace, nodePublishSecretRef.Name, err)
+			return nil, &StorageReadError{Resource: "node publish secret", Key: secretKey, Err: err}
 		}
 	}
 
@@ -114,7 +178,7 @@ func (h *CSIMountHandler) GenerateNodePublishVolumeRequest(ctx context.Context, 
 		}
 		mergedPath, err := mergeAndValidatePaths(basePath, mountRequest.SubPath)
 		if err != nil {
-			return "", nil, fmt.Errorf("failed to merge and validate paths: base path=%s, sub path=%s, err: %v", basePath, mountRequest.SubPath, err)
+			return nil, fmt.Errorf("failed to merge and validate paths: base path=%s, sub path=%s: %w", basePath, mountRequest.SubPath, err)
 		}
 		persistentVolumeObj.Spec.CSI.VolumeAttributes["path"] = mergedPath
 	}
@@ -130,10 +194,15 @@ func (h *CSIMountHandler) GenerateNodePublishVolumeRequest(ctx context.Context, 
 	if err != nil {
 		// Never hand a half-built request back alongside an error: it may already
 		// carry the volume Secrets, and no caller has a use for it.
-		return "", nil, err
+		return nil, err
 	}
 	log.Info("generate csi node publish volume request for sandbox", "mountCost", time.Since(startTime))
-	return persistentVolumeObj.Spec.CSI.Driver, csiRequest, nil
+	return &storages.MountPlan{
+		Driver:         persistentVolumeObj.Spec.CSI.Driver,
+		Strategy:       storages.MountStrategyDirectNodePublish,
+		VolumeIdentity: csiRequest.VolumeId,
+		PublishRequest: csiRequest,
+	}, nil
 }
 
 // NodePublishVolumeEnricher is an optional hook that enriches PV VolumeAttributes

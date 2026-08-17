@@ -26,6 +26,7 @@ import (
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/openkruise/agents/api/v1alpha1"
@@ -949,6 +950,60 @@ func (m *mockVolumeMountProvider) GenerateCSINodePublishVolumeRequest(
 		VolumeId:   persistentVolumeObj.Name,
 		TargetPath: containerMountTarget,
 	}, nil
+}
+
+func TestGenerateMountPlanUsesVEPFSStagedCapability(t *testing.T) {
+	pv := &corev1.PersistentVolume{
+		ObjectMeta: metav1.ObjectMeta{Name: "vepfs-pv", UID: types.UID("vepfs-pv-uid")},
+		Spec: corev1.PersistentVolumeSpec{
+			ClaimRef: &corev1.ObjectReference{
+				Namespace: "storage",
+				Name:      "vepfs-pvc",
+				UID:       types.UID("vepfs-pvc-uid"),
+			},
+			PersistentVolumeSource: corev1.PersistentVolumeSource{
+				CSI: &corev1.CSIPersistentVolumeSource{
+					Driver:       storages.VEPFSCSIDriverName,
+					VolumeHandle: "vepfs-volume-handle",
+					VolumeAttributes: map[string]string{
+						storages.VEPFSAttributeFSID:           "fs-vepfs-01",
+						storages.VEPFSAttributeMountServiceID: "mount-aed6284f",
+					},
+					NodePublishSecretRef: &corev1.SecretReference{
+						Name:      "not-loaded-for-anchor",
+						Namespace: utils.DefaultSandboxDeployNamespace,
+					},
+				},
+			},
+			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteMany},
+		},
+	}
+	c, _, err := cachetest.NewTestCache(t, pv)
+	require.NoError(t, err)
+	registry := &mockStorageProviderRegistry{
+		supportedDrivers: map[string]bool{storages.VEPFSCSIDriverName: true},
+		providers: map[string]storages.VolumeMountProvider{
+			storages.VEPFSCSIDriverName: &storages.VEPFSMountProvider{},
+		},
+	}
+	handler := NewCSIMountHandler(c.GetClient(), c.GetAPIReader(), registry, utils.DefaultSandboxDeployNamespace)
+	request := v1alpha1.CSIMountConfig{
+		PvName:    "vepfs-pv",
+		MountPath: "/workspace/data",
+		SubPath:   "users/42",
+	}
+
+	plan, err := handler.GenerateMountPlan(context.Background(), request)
+
+	require.NoError(t, err)
+	require.Equal(t, storages.MountStrategyKubeletAnchor, plan.Strategy)
+	require.Equal(t, "mount-aed6284f", plan.Placement.DomainValue)
+	require.Equal(t, "users/42", plan.Anchor.SubPath)
+
+	driver, publishRequest, err := handler.GenerateNodePublishVolumeRequest(context.Background(), request)
+	require.ErrorContains(t, err, "requires lifecycle strategy")
+	require.Empty(t, driver)
+	require.Nil(t, publishRequest)
 }
 
 func TestGenerateNodePublishVolumeRequest_AgentIdentitySkipsSecret(t *testing.T) {
