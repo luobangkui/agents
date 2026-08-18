@@ -45,15 +45,6 @@ type StorageAPI interface {
 	Mount(ctx context.Context, req CreateMountRequest) (CreateMountResponse, error)
 }
 
-// StorageUnmountAPI is an additive lifecycle capability. Keeping it separate
-// from StorageAPI preserves source compatibility for existing custom clients
-// that implement only mount.
-type StorageUnmountAPI interface {
-	// Unmount releases a mount by calling DELETE /v1/storage/mounts with the
-	// original publish request as its stable identity.
-	Unmount(ctx context.Context, req DeleteMountRequest) (DeleteMountResponse, error)
-}
-
 // CreateMountRequest is the request body accepted by POST /v1/storage/mounts.
 // It is the transport-neutral representation of a single CSI mount intent:
 //
@@ -153,14 +144,6 @@ type CreateMountResponse struct {
 	Message string `json:"message,omitempty"`
 }
 
-// DeleteMountRequest intentionally has the same lossless wire contract as
-// CreateMountRequest. The original publish request is required to derive the
-// exact target selected during mount.
-type DeleteMountRequest = CreateMountRequest
-
-// DeleteMountResponse mirrors the structured mount response for unmount.
-type DeleteMountResponse = CreateMountResponse
-
 // storageAPI is the default StorageAPI implementation. It delegates transport to
 // the owning runtimeClient and carries no domain logic of its own.
 type storageAPI struct {
@@ -200,35 +183,5 @@ func (s *storageAPI) Mount(ctx context.Context, req CreateMountRequest) (CreateM
 	}
 
 	log.Info("csi mount completed", "mountPath", resp.MountPath, "cost", time.Since(start))
-	return resp, nil
-}
-
-// Unmount implements StorageAPI by deleting the mount resource. Missing CSI
-// identity is rejected locally and success=false remains a logical failure even
-// on a 2xx HTTP response.
-func (s *storageAPI) Unmount(ctx context.Context, req DeleteMountRequest) (DeleteMountResponse, error) {
-	if req.PublishRequest == nil {
-		err := fmt.Errorf("csi publish request is required for unmount driver %q", req.Driver)
-		klog.FromContext(ctx).Error(err, "csi unmount rejected before dispatch",
-			"sandbox", klog.KObj(s.r.sbx), "driver", req.Driver)
-		return DeleteMountResponse{}, err
-	}
-
-	log := klog.FromContext(ctx).WithValues("sandbox", klog.KObj(s.r.sbx), "driver", req.Driver,
-		"targetPath", req.PublishRequest.GetTargetPath())
-	start := time.Now()
-
-	var resp DeleteMountResponse
-	if err := s.r.call(ctx, http.MethodDelete, storageMountsPath, req, &resp); err != nil {
-		log.Error(err, "csi unmount failed", "cost", time.Since(start))
-		return DeleteMountResponse{}, err
-	}
-	if !resp.Success {
-		err := fmt.Errorf("runtime reported unmount failure for driver %q: %s", req.Driver, resp.Message)
-		log.Error(err, "csi unmount rejected by runtime", "cost", time.Since(start))
-		return resp, err
-	}
-
-	log.Info("csi unmount completed", "mountPath", resp.MountPath, "cost", time.Since(start))
 	return resp, nil
 }

@@ -173,10 +173,6 @@ docker-buildx-runtime: ## Build multi-platform docker image for agent-runtime.
 docker-pushx-runtime: ## Build and push multi-platform docker image for agent-runtime.
 	docker buildx build --platform=$(PLATFORMS) --build-arg VERSION=$(RUNTIME_VERSION) -f dockerfiles/agent-runtime.Dockerfile -t ${RUNTIME_IMG} --push .
 
-.PHONY: docker-pushx-kubelet-anchor-mounter
-docker-pushx-kubelet-anchor-mounter: ## Build and push the kubelet-anchor mounter image.
-	docker buildx build --platform=$(PLATFORMS) -f dockerfiles/kubelet-anchor-mounter.Dockerfile -t ${ANCHOR_MOUNTER_IMG} --push .
-
 .PHONY: build-sandbox-gateway
 build-sandbox-gateway: $(LOCALBIN) ## Build sandbox-gateway plugin binary.
 	CGO_ENABLED=1 go build -buildmode=c-shared -trimpath -ldflags="-s -w" -o $(GATEWAY_SO_FILE) ./cmd/sandbox-gateway/.

@@ -17,7 +17,6 @@ limitations under the License.
 package nas
 
 import (
-	"context"
 	"maps"
 	"testing"
 
@@ -84,18 +83,4 @@ func TestProviderIdentity(t *testing.T) {
 	p := &provider{}
 	require.Equal(t, driverName, p.Driver())
 	require.Equal(t, "nas", p.SubDir())
-}
-
-func TestProviderUnmountUsesCSIUnpublish(t *testing.T) {
-	req := csi.NodePublishVolumeRequest{VolumeId: "nas-pv-1", TargetPath: "/real/nas/target"}
-	originalRunner := runNodeUnpublishVolumeFn
-	runNodeUnpublishVolumeFn = func(ctx context.Context, driver string, got csi.NodePublishVolumeRequest) error {
-		require.NotNil(t, ctx)
-		require.Equal(t, driverName, driver)
-		require.Equal(t, req, got)
-		return nil
-	}
-	t.Cleanup(func() { runNodeUnpublishVolumeFn = originalRunner })
-
-	require.NoError(t, (&provider{}).Unmount(context.Background(), req))
 }

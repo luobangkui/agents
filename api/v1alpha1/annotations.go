@@ -42,9 +42,6 @@ const (
 	// AnnotationUpdatedMetadataInClaim stores the keys of labels/annotations added or modified
 	// during the claim flow (JSON format, keys only). Used by the recycle flow to reset metadata.
 	AnnotationUpdatedMetadataInClaim = InternalPrefix + "updated-metadata-in-claim"
-	// AnnotationCSIDirectUnmountRecords stores non-secret, stable identities for
-	// direct CSI cleanup without depending on the source PV still existing.
-	AnnotationCSIDirectUnmountRecords = InternalPrefix + "csi-direct-unmount-records"
 
 	AnnotationRuntimeURL         = InternalPrefix + "runtime-url"
 	AnnotationRuntimeAccessToken = InternalPrefix + "runtime-access-token"

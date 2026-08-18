@@ -60,14 +60,6 @@ import (
 	"github.com/openkruise/agents/pkg/utils/testutils"
 )
 
-func registerRequestStorageProvider(t *testing.T, controller *Controller, driver string, provider storages.VolumeMountProvider) {
-	t.Helper()
-	controller.storageRegistry.RegisterProvider(driver, provider)
-	infraInstance, ok := controller.manager.GetInfra().(*sandboxcr.Infra)
-	require.True(t, ok, "E2B tests require sandboxcr infrastructure")
-	infraInstance.StorageRegistry.RegisterProvider(driver, provider)
-}
-
 var TestServerPort = 9999
 var Namespace = models.AdminTeamName
 var InitKey = "admin-987654321"

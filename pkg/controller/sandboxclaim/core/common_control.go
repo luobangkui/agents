@@ -449,25 +449,30 @@ func (c *commonControl) applyInitRuntimeOptions(ctx context.Context, opts *infra
 // metadata from the given mount configurations.
 func (c *commonControl) buildCSIMountOptions(ctx context.Context, mounts []agentsv1alpha1.CSIMountConfig) (*config.CSIMountOptions, string, string, error) {
 	logger := logf.FromContext(ctx)
-	opts := &config.CSIMountOptions{}
+	csiMountOptions := make([]config.MountConfig, 0, len(mounts))
 	csiClient := csiutils.NewCSIMountHandler(c.cache.GetClient(), c.cache.GetAPIReader(), c.storageRegistry, utils.DefaultSandboxDeployNamespace)
 	for _, mountConfig := range mounts {
-		plan, genErr := csiClient.GenerateMountPlan(ctx, mountConfig)
+		driverName, publishRequest, genErr := csiClient.GenerateNodePublishVolumeRequest(ctx, mountConfig)
 		if genErr != nil {
 			errMsg := "failed to generate csi mount options config for sandbox"
 			logger.Error(genErr, errMsg, "mountConfigRequest", mountConfig)
-			return nil, "", "", fmt.Errorf("%s: %w", errMsg, genErr)
+			return nil, "", "", fmt.Errorf("%s, err: %v", errMsg, genErr)
 		}
-		if genErr = opts.AppendMountPlan(plan); genErr != nil {
-			return nil, "", "", genErr
-		}
+		csiMountOptions = append(csiMountOptions, config.MountConfig{
+			Driver:         driverName,
+			PublishRequest: publishRequest,
+		})
+	}
+
+	opts := &config.CSIMountOptions{
+		MountOptionList: csiMountOptions,
 	}
 
 	// json marshal csi mount config to raw string
 	csiMountOptionsRaw, err := json.Marshal(mounts)
 	if err != nil {
 		logger.Error(err, "failed to marshal csi mount config")
-		return nil, "", "", fmt.Errorf("failed to marshal csi mount config: %w", err)
+		return nil, "", "", fmt.Errorf("failed to marshal csi mount config, err: %v", err)
 	}
 	opts.MountOptionListRaw = string(csiMountOptionsRaw)
 
@@ -478,7 +483,7 @@ func (c *commonControl) buildCSIMountOptions(ctx context.Context, mounts []agent
 		storageAuthKey, storageAuthValue, err = csiutils.BuildStorageAuthAnnotation(ctx, c.cache.GetClient(), mounts)
 		if err != nil {
 			logger.Error(err, "failed to build storage auth annotation")
-			return nil, "", "", fmt.Errorf("failed to build storage auth annotation: %w", err)
+			return nil, "", "", fmt.Errorf("failed to build storage auth annotation: %v", err)
 		}
 	}
 

@@ -278,14 +278,6 @@ type Infrastructure interface {
 	DeleteVolume(ctx context.Context, opts DeleteVolumeOptions) error
 }
 
-// DynamicMountCleaner is an optional infrastructure capability. The manager
-// calls it before recycle/delete so staged mounts cannot leak into the next
-// pooled sandbox session. Implementations without staged mounts need not
-// implement it.
-type DynamicMountCleaner interface {
-	CleanupDynamicMounts(ctx context.Context, sandbox Sandbox) error
-}
-
 type Sandbox interface {
 	metav1.Object                                         // For K8s object metadata access
 	Pause(ctx context.Context, opts PauseOptions) error   // Pause a Sandbox

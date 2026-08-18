@@ -34,7 +34,6 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 
 	agentsv1alpha1 "github.com/openkruise/agents/api/v1alpha1"
-	"github.com/openkruise/agents/pkg/agent-runtime/storages"
 	"github.com/openkruise/agents/pkg/utils/runtime/config"
 	"github.com/openkruise/agents/proto/envd/process"
 	"github.com/openkruise/agents/proto/envd/process/processconnect"
@@ -781,98 +780,6 @@ func TestDoCSIMount_LegacyTransportEncodesRequest(t *testing.T) {
 	decoded := &csi.NodePublishVolumeRequest{}
 	require.NoError(t, proto.Unmarshal(raw, protoadapt.MessageV2Of(decoded)))
 	assert.True(t, protoEqual(publishRequest, decoded), "the CLI must receive the caller's request unchanged")
-	assert.Equal(t, []string{"--timeout", "30s"}, args[5:])
-}
-
-func TestDirectCSIUnmountRecordsExcludeSensitiveMountData(t *testing.T) {
-	sbx := &agentsv1alpha1.Sandbox{}
-	request := &csi.NodePublishVolumeRequest{
-		VolumeId:       "volume-a",
-		TargetPath:     "/workspace/data",
-		Readonly:       true,
-		Secrets:        map[string]string{"token": "super-secret"},
-		PublishContext: map[string]string{"session": "publish-secret"},
-		VolumeContext: map[string]string{
-			"server":     "storage.example.com",
-			"credential": "volume-secret",
-		},
-		VolumeCapability: &csi.VolumeCapability{AccessType: &csi.VolumeCapability_Mount{
-			Mount: &csi.VolumeCapability_MountVolume{FsType: "ext4"},
-		}},
-	}
-	expectedHash := storages.DirectMountTargetHash("driver.example", *request)
-	require.NoError(t, RecordDirectCSIUnmounts(sbx, &config.CSIMountOptions{
-		MountOptionList: []config.MountConfig{{Driver: "driver.example", PublishRequest: request}},
-	}))
-
-	raw := sbx.Annotations[agentsv1alpha1.AnnotationCSIDirectUnmountRecords]
-	require.NotEmpty(t, raw)
-	for _, sensitive := range []string{"super-secret", "publish-secret", "volume-secret", "storage.example.com"} {
-		require.NotContains(t, raw, sensitive)
-	}
-
-	opts, found, err := DirectCSIUnmountOptionsFromAnnotation(sbx)
-	require.NoError(t, err)
-	require.True(t, found)
-	require.Len(t, opts.MountOptionList, 1)
-	restored := opts.MountOptionList[0]
-	require.Equal(t, "driver.example", restored.Driver)
-	require.Equal(t, "volume-a", restored.PublishRequest.GetVolumeId())
-	require.Equal(t, "/workspace/data", restored.PublishRequest.GetTargetPath())
-	require.Empty(t, restored.PublishRequest.GetSecrets())
-	require.Empty(t, restored.PublishRequest.GetPublishContext())
-	actualHash, err := storages.DirectUnmountTargetHash(restored.Driver, *restored.PublishRequest)
-	require.NoError(t, err)
-	require.Equal(t, expectedHash, actualHash)
-}
-
-func TestRecordDirectCSIUnmountsMarksStagedOnlyConfiguration(t *testing.T) {
-	sbx := &agentsv1alpha1.Sandbox{}
-	require.NoError(t, RecordDirectCSIUnmounts(sbx, &config.CSIMountOptions{
-		StagedMountOptionList: []config.StagedMountConfig{{}},
-	}))
-	require.JSONEq(t, `[]`, sbx.Annotations[agentsv1alpha1.AnnotationCSIDirectUnmountRecords])
-
-	opts, found, err := DirectCSIUnmountOptionsFromAnnotation(sbx)
-	require.NoError(t, err)
-	require.True(t, found)
-	require.Empty(t, opts.MountOptionList)
-}
-
-func TestProcessCSIUnmountsUsesLegacyUnmountContract(t *testing.T) {
-	publishRequest := testPublishRequest("/data/workspace")
-	gotArgs := make(chan []string, 1)
-	handler := &mockProcessHandler{
-		startFn: func(_ context.Context, req *connect.Request[process.StartRequest], stream *connect.ServerStream[process.StartResponse]) error {
-			gotArgs <- req.Msg.Process.Args
-			if err := stream.Send(&process.StartResponse{Event: &process.ProcessEvent{
-				Event: &process.ProcessEvent_Start{Start: &process.ProcessEvent_StartEvent{Pid: 1}},
-			}}); err != nil {
-				return err
-			}
-			return stream.Send(&process.StartResponse{Event: &process.ProcessEvent{
-				Event: &process.ProcessEvent_End{End: &process.ProcessEvent_EndEvent{ExitCode: 0, Exited: true}},
-			}})
-		},
-	}
-	_, sbx := newMockRuntimeServer(t, handler)
-	opts := config.CSIMountOptions{MountOptionList: []config.MountConfig{{
-		Driver:         "nfs",
-		PublishRequest: publishRequest,
-	}}}
-
-	duration, err := ProcessCSIUnmounts(context.Background(), sbx, opts)
-
-	require.NoError(t, err)
-	require.Positive(t, duration)
-	args := <-gotArgs
-	require.Len(t, args, 7)
-	assert.Equal(t, []string{"unmount", "--driver", "nfs", "--config"}, args[:4])
-	raw, err := base64.StdEncoding.DecodeString(args[4])
-	require.NoError(t, err)
-	decoded := &csi.NodePublishVolumeRequest{}
-	require.NoError(t, proto.Unmarshal(raw, protoadapt.MessageV2Of(decoded)))
-	assert.True(t, protoEqual(publishRequest, decoded))
 	assert.Equal(t, []string{"--timeout", "30s"}, args[5:])
 }
 

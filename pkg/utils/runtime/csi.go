@@ -23,9 +23,6 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"path"
-	"sort"
-	"strings"
 	"sync"
 	"time"
 
@@ -38,6 +35,7 @@ import (
 
 	agentsv1alpha1 "github.com/openkruise/agents/api/v1alpha1"
 	"github.com/openkruise/agents/pkg/agent-runtime/storages"
+	"github.com/openkruise/agents/pkg/cache"
 	"github.com/openkruise/agents/pkg/utils"
 	csimountutils "github.com/openkruise/agents/pkg/utils/csiutils"
 	"github.com/openkruise/agents/pkg/utils/logs"
@@ -111,99 +109,6 @@ func csiMount(
 	return nil
 }
 
-// CSIUnmount releases a dynamic mount through the legacy sandbox-storage CLI.
-// It accepts the original NodePublishVolume request because that is the stable
-// identity contract shared with the mount command.
-func CSIUnmount(ctx context.Context, sbx *agentsv1alpha1.Sandbox, driver string, request string) error {
-	return csiUnmount(ctx, sbx, driver, request, csiMountTimeout)
-}
-
-func csiUnmount(
-	ctx context.Context,
-	sbx *agentsv1alpha1.Sandbox,
-	driver string,
-	request string,
-	timeout time.Duration,
-) error {
-	log := klog.FromContext(ctx).WithValues("sandbox", klog.KObj(sbx))
-	startTime := time.Now()
-	if timeout <= 0 {
-		timeout = config.DefaultCSIMountTimeout
-	}
-	processConfig := &process.ProcessConfig{
-		Cmd: MountCommand,
-		Args: []string{
-			"unmount",
-			"--driver", driver,
-			"--config", request,
-			"--timeout", timeout.String(),
-		},
-		Envs: map[string]string{
-			"POD_UID": string(sbx.Status.PodInfo.PodUID),
-		},
-	}
-
-	result, err := RunCommandWithRuntime(ctx, RunCmdFuncArgs{
-		Sbx:           sbx,
-		ProcessConfig: processConfig,
-		Timeout:       timeout,
-		AuthUser:      "root",
-	})
-	if err != nil {
-		log.Error(err, "failed to run CSI unmount command", "stdout", result.Stdout, "stderr", result.Stderr)
-		return err
-	}
-	if result.ExitCode != 0 {
-		err = fmt.Errorf("command failed: [%d] %s", result.ExitCode, result.Stderr)
-		log.Error(err, "CSI unmount command failed", "exitCode", result.ExitCode)
-		return err
-	}
-	log.Info("execute csi unmount command", "driverName", driver, "unmountCost", time.Since(startTime))
-	return nil
-}
-
-// ExposeKubeletAnchor creates the user-visible symlink after a same-node
-// kubelet anchor has propagated its bind mount into the sandbox mount-root.
-func ExposeKubeletAnchor(ctx context.Context, sbx *agentsv1alpha1.Sandbox, identity, mountPath string) error {
-	return changeKubeletAnchorExposure(ctx, sbx, "expose", identity, mountPath)
-}
-
-// UnexposeKubeletAnchor removes only the symlink owned by identity. The anchor
-// mounter must already have unmounted the propagated bind before this is called.
-func UnexposeKubeletAnchor(ctx context.Context, sbx *agentsv1alpha1.Sandbox, identity, mountPath string) error {
-	return changeKubeletAnchorExposure(ctx, sbx, "unexpose", identity, mountPath)
-}
-
-// DiscardKubeletAnchorExposure is the rollback form of Unexpose. It removes an
-// owned link but treats a missing or foreign path as success because Expose may
-// have failed before ownership was durably recorded.
-func DiscardKubeletAnchorExposure(ctx context.Context, sbx *agentsv1alpha1.Sandbox, identity, mountPath string) error {
-	return changeKubeletAnchorExposure(ctx, sbx, "discard-exposure", identity, mountPath)
-}
-
-func changeKubeletAnchorExposure(ctx context.Context, sbx *agentsv1alpha1.Sandbox, operation, identity, mountPath string) error {
-	result, err := RunCommandWithRuntime(ctx, RunCmdFuncArgs{
-		Sbx: sbx,
-		ProcessConfig: &process.ProcessConfig{
-			Cmd: MountCommand,
-			Args: []string{
-				operation,
-				"--identity", identity,
-				"--mount-path", mountPath,
-			},
-		},
-		Timeout:  csiMountTimeout,
-		AuthUser: "root",
-	})
-	if err != nil {
-		return fmt.Errorf("failed to %s kubelet anchor: %w (stderr: %s)", operation, err, result.Stderr)
-	}
-	if result.ExitCode != 0 {
-		return fmt.Errorf("failed to %s kubelet anchor: exit code %d: %s", operation, result.ExitCode, result.Stderr)
-	}
-	return nil
-}
-
 // ProcessCSIMounts performs CSI volume mounting operations for all mount configurations concurrently.
 // It uses opts.Concurrency to limit the number of concurrent mount goroutines.
 // If Concurrency is 0 or negative, it defaults to config.DefaultCSIMountConcurrency.
@@ -266,38 +171,6 @@ func ProcessCSIMounts(ctx context.Context, sbx *agentsv1alpha1.Sandbox, opts con
 	return time.Since(start), errors.Join(errs...)
 }
 
-// ProcessCSIUnmounts releases all resolved mounts. Targets are processed
-// deepest-first and sequentially so a parent path cannot be detached while a
-// nested child mount is still active. All failures are collected to give later
-// targets a chance to clean up.
-func ProcessCSIUnmounts(ctx context.Context, sbx *agentsv1alpha1.Sandbox, opts config.CSIMountOptions, rtOpts ...Option) (time.Duration, error) {
-	start := time.Now()
-	timeout := opts.Timeout
-	if timeout <= 0 {
-		timeout = csiMountTimeout
-	}
-	unmounts := append([]config.MountConfig(nil), opts.MountOptionList...)
-	sort.SliceStable(unmounts, func(i, j int) bool {
-		return mountPathDepth(unmounts[i].PublishRequest) > mountPathDepth(unmounts[j].PublishRequest)
-	})
-
-	var errs []error
-	for _, opt := range unmounts {
-		_, err := doCSIUnmountWithTimeout(ctx, sbx, opt, timeout, rtOpts...)
-		if err != nil {
-			errs = append(errs, err)
-		}
-	}
-	return time.Since(start), errors.Join(errs...)
-}
-
-func mountPathDepth(req *csi.NodePublishVolumeRequest) int {
-	if req == nil {
-		return -1
-	}
-	return strings.Count(path.Clean(req.TargetPath), "/")
-}
-
 // doCSIMount performs a single CSI mount, dispatching between the two coexisting
 // transports: the runtime storage API (HTTPS, when rtOpts carries the TLS options
 // for a TLS-capable sandbox) and the legacy sandbox-storage CLI (plaintext envd
@@ -349,46 +222,6 @@ func doCSIMountWithTimeout(
 	return time.Since(start), err
 }
 
-func doCSIUnmountWithTimeout(
-	ctx context.Context,
-	sbx *agentsv1alpha1.Sandbox,
-	opts config.MountConfig,
-	timeout time.Duration,
-	rtOpts ...Option,
-) (time.Duration, error) {
-	ctx = logs.Extend(ctx, "action", "csiUnmount")
-	if timeout <= 0 {
-		timeout = config.DefaultCSIMountTimeout
-	}
-	ctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-	start := time.Now()
-	if opts.PublishRequest == nil {
-		return time.Since(start), fmt.Errorf("csi publish request is required for unmount driver %q", opts.Driver)
-	}
-	if len(rtOpts) > 0 {
-		storageAPI := NewRuntime(sbx, rtOpts...).Storage()
-		unmountAPI, ok := storageAPI.(StorageUnmountAPI)
-		if !ok {
-			return time.Since(start), fmt.Errorf("runtime storage API does not support unmount")
-		}
-		_, err := unmountAPI.Unmount(ctx, DeleteMountRequest{
-			Driver:         opts.Driver,
-			PublishRequest: opts.PublishRequest,
-		})
-		if err != nil {
-			return time.Since(start), fmt.Errorf("failed to unmount via runtime storage API for driver %q: %w", opts.Driver, err)
-		}
-		return time.Since(start), nil
-	}
-	requestRaw, err := encodePublishRequest(opts.PublishRequest)
-	if err != nil {
-		return time.Since(start), fmt.Errorf("failed to encode csi publish request for unmount driver %q: %w", opts.Driver, err)
-	}
-	err = csiUnmount(ctx, sbx, opts.Driver, requestRaw, timeout)
-	return time.Since(start), err
-}
-
 // encodePublishRequest renders the typed CSI request as the base64 protobuf blob
 // the sandbox-storage CLI expects on its --config flag. It is the only place the
 // control plane still pre-encodes a mount request, and it disappears with the
@@ -421,7 +254,7 @@ func GetCsiMountExtensionRequest(s metav1.Object) ([]agentsv1alpha1.CSIMountConf
 
 // ResolveCSIMountFromAnnotation parses CSI mount config from sandbox annotation and resolves it into MountOptionList.
 // Returns nil if no CSI mount annotation is present.
-func ResolveCSIMountFromAnnotation(ctx context.Context, obj metav1.Object, kubeClient client.Client, storageRegistry storages.VolumeMountProviderRegistry) (*config.CSIMountOptions, error) {
+func ResolveCSIMountFromAnnotation(ctx context.Context, obj metav1.Object, client client.Client, cache cache.Provider, storageRegistry storages.VolumeMountProviderRegistry) (*config.CSIMountOptions, error) {
 	log := klog.FromContext(ctx)
 	csiMountConfigs, err := GetCsiMountExtensionRequest(obj)
 	if err != nil {
@@ -431,114 +264,15 @@ func ResolveCSIMountFromAnnotation(ctx context.Context, obj metav1.Object, kubeC
 	if len(csiMountConfigs) == 0 {
 		return nil, nil
 	}
-	return ResolveCSIMountConfigs(ctx, csiMountConfigs, kubeClient, storageRegistry)
-}
-
-// ResolveCSIMountConfigs converts user CSI intents into provider lifecycle
-// plans inside the infrastructure layer. Both reads use the informer-backed
-// client; callers must not bypass the cache merely because a plan is being
-// built for an on-demand request.
-func ResolveCSIMountConfigs(
-	ctx context.Context,
-	csiMountConfigs []agentsv1alpha1.CSIMountConfig,
-	kubeClient client.Client,
-	storageRegistry storages.VolumeMountProviderRegistry,
-) (*config.CSIMountOptions, error) {
-	log := klog.FromContext(ctx)
-	csiClient := csimountutils.NewCSIMountHandler(kubeClient, kubeClient, storageRegistry, utils.DefaultSandboxDeployNamespace)
-	opts := &config.CSIMountOptions{}
+	csiClient := csimountutils.NewCSIMountHandler(cache.GetClient(), cache.GetAPIReader(), storageRegistry, utils.DefaultSandboxDeployNamespace)
+	mountOptionList := make([]config.MountConfig, 0, len(csiMountConfigs))
 	for _, cfg := range csiMountConfigs {
-		plan, genErr := csiClient.GenerateMountPlan(ctx, cfg)
+		driverName, publishRequest, genErr := csiClient.GenerateNodePublishVolumeRequest(ctx, cfg)
 		if genErr != nil {
 			log.Error(genErr, "failed to generate csi mount options config", "mountConfig", cfg)
 			return nil, fmt.Errorf("failed to generate csi mount options config: %w", genErr)
 		}
-		if genErr = opts.AppendMountPlan(plan); genErr != nil {
-			return nil, genErr
-		}
+		mountOptionList = append(mountOptionList, config.MountConfig{Driver: driverName, PublishRequest: publishRequest})
 	}
-	return opts, nil
-}
-
-type directCSIUnmountRecord struct {
-	Driver          string `json:"driver"`
-	VolumeID        string `json:"volumeID"`
-	TargetPath      string `json:"targetPath"`
-	MountTargetHash string `json:"mountTargetHash"`
-}
-
-// RecordDirectCSIUnmounts persists only the identity needed by
-// NodeUnpublishVolume. CSI Secrets, PublishContext, VolumeContext and volume
-// capability are deliberately excluded from the Sandbox annotation.
-func RecordDirectCSIUnmounts(obj metav1.Object, opts *config.CSIMountOptions) error {
-	annotations := obj.GetAnnotations()
-	if annotations == nil {
-		annotations = make(map[string]string)
-	}
-	records := make([]directCSIUnmountRecord, 0)
-	if opts != nil {
-		for _, mount := range opts.MountOptionList {
-			if mount.PublishRequest == nil {
-				return fmt.Errorf("direct unmount record for driver %q has no publish request", mount.Driver)
-			}
-			if strings.TrimSpace(mount.Driver) == "" || strings.TrimSpace(mount.PublishRequest.VolumeId) == "" ||
-				strings.TrimSpace(mount.PublishRequest.TargetPath) == "" {
-				return fmt.Errorf("direct unmount record has incomplete identity")
-			}
-			records = append(records, directCSIUnmountRecord{
-				Driver:          mount.Driver,
-				VolumeID:        mount.PublishRequest.VolumeId,
-				TargetPath:      mount.PublishRequest.TargetPath,
-				MountTargetHash: storages.DirectMountTargetHash(mount.Driver, *mount.PublishRequest),
-			})
-		}
-	}
-	if opts == nil {
-		delete(annotations, agentsv1alpha1.AnnotationCSIDirectUnmountRecords)
-		obj.SetAnnotations(annotations)
-		return nil
-	}
-	raw, err := json.Marshal(records)
-	if err != nil {
-		return fmt.Errorf("marshal direct CSI unmount records: %w", err)
-	}
-	annotations[agentsv1alpha1.AnnotationCSIDirectUnmountRecords] = string(raw)
-	obj.SetAnnotations(annotations)
-	return nil
-}
-
-// DirectCSIUnmountOptionsFromAnnotation restores cleanup requests from the
-// stable, non-secret records captured before mount. found distinguishes a
-// legacy Sandbox (no records) from a Sandbox that intentionally had no direct
-// mounts.
-func DirectCSIUnmountOptionsFromAnnotation(obj metav1.Object) (opts *config.CSIMountOptions, found bool, err error) {
-	raw, found := obj.GetAnnotations()[agentsv1alpha1.AnnotationCSIDirectUnmountRecords]
-	if !found {
-		return nil, false, nil
-	}
-	var records []directCSIUnmountRecord
-	if err := json.Unmarshal([]byte(raw), &records); err != nil {
-		return nil, true, fmt.Errorf("parse direct CSI unmount records: %w", err)
-	}
-	opts = &config.CSIMountOptions{}
-	for _, record := range records {
-		request := &csi.NodePublishVolumeRequest{
-			VolumeId:   record.VolumeID,
-			TargetPath: record.TargetPath,
-			VolumeContext: map[string]string{
-				storages.DirectMountTargetHashContextKey: record.MountTargetHash,
-			},
-		}
-		if record.Driver == "" || record.VolumeID == "" || record.TargetPath == "" {
-			return nil, true, fmt.Errorf("direct CSI unmount record has incomplete identity")
-		}
-		if _, err := storages.DirectUnmountTargetHash(record.Driver, *request); err != nil {
-			return nil, true, err
-		}
-		opts.MountOptionList = append(opts.MountOptionList, config.MountConfig{
-			Driver:         record.Driver,
-			PublishRequest: request,
-		})
-	}
-	return opts, true, nil
+	return &config.CSIMountOptions{MountOptionList: mountOptionList}, nil
 }
