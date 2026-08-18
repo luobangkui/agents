@@ -1,35 +1,42 @@
 # Build stage
-FROM --platform=$BUILDPLATFORM golang:1.25 AS builder
+FROM golang:1.25 AS builder
 ARG TARGETOS
 ARG TARGETARCH
 
 WORKDIR /app
 
 # Copy go mod and sum files
-COPY go.mod go.sum ./
+COPY ../go.mod go.sum ./
 
 # Download dependencies
 RUN go mod download
 
 # Copy the source code
-COPY cmd/sandbox-manager ./cmd/sandbox-manager
-COPY pkg ./pkg
-COPY api  ./api
-COPY client ./client
-COPY proto ./proto
-COPY test ./test
+COPY ../cmd/sandbox-manager ./cmd/sandbox-manager
+COPY ../pkg ./pkg
+COPY ../api  ./api
+COPY ../client ./client
+COPY ../proto ./proto
+COPY ../test ./test
 
 # Build the binary
 RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -a -installsuffix cgo -o sandbox-manager ./cmd/sandbox-manager
 
 # Final stage
-FROM --platform=$TARGETPLATFORM alpine:3.20 AS runtime
+FROM alpine:3.20 AS runtime
+
+RUN sed -i 's/dl-cdn.alpinelinux.org/mirrors.aliyun.com/g' /etc/apk/repositories && \
+    apk --no-cache add ca-certificates && \
+    rm -rf /usr/local/sbin/* && \
+    rm -rf /usr/local/bin/* && \
+    rm -rf /usr/sbin/* && \
+    rm -rf /usr/bin/* && \
+    rm -rf /sbin/* && \
+    rm -rf /bin/*
 
 WORKDIR /
 # Copy the binary from builder stage
 COPY --from=builder /app/sandbox-manager .
-COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
-RUN rm -rf /usr/local/sbin/* /usr/local/bin/* /usr/sbin/* /usr/bin/* /sbin/* /bin/*
 USER 65532:65532
 
 # Expose port

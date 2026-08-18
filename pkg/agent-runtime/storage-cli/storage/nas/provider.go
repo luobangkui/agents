@@ -31,8 +31,6 @@ const driverName = "nasplugin.csi.alibabacloud.com"
 
 type provider struct{}
 
-var runNodeUnpublishVolumeFn = storage.RunNodeUnpublishVolume
-
 func init() {
 	storage.Register(&provider{})
 }
@@ -68,8 +66,8 @@ func (p *provider) Mount(ctx context.Context, req csi.NodePublishVolumeRequest, 
 	return storage.RunNodePublishVolume(ctx, driverName, req, debug)
 }
 
-func (p *provider) Unmount(ctx context.Context, req csi.NodePublishVolumeRequest) error {
-	return runNodeUnpublishVolumeFn(ctx, driverName, req)
+func (p *provider) Unmount(context.Context, csi.NodePublishVolumeRequest) error {
+	return nil
 }
 
 var _ storage.Provider = (*provider)(nil)

@@ -52,17 +52,12 @@ func (c *nopCloser) Close() error {
 type fakeNodeClient struct {
 	csi.NodeClient
 
-	gotReq          *csi.NodePublishVolumeRequest
-	gotCtx          context.Context
-	resp            *csi.NodePublishVolumeResponse
-	err             error
-	calls           atomic.Int32
-	onCall          func(ctx context.Context)
-	gotUnpublishReq *csi.NodeUnpublishVolumeRequest
-	unpublishResp   *csi.NodeUnpublishVolumeResponse
-	unpublishErr    error
-	unpublishCalls  atomic.Int32
-	onUnpublishCall func(ctx context.Context)
+	gotReq *csi.NodePublishVolumeRequest
+	gotCtx context.Context
+	resp   *csi.NodePublishVolumeResponse
+	err    error
+	calls  atomic.Int32
+	onCall func(ctx context.Context)
 }
 
 func (f *fakeNodeClient) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolumeRequest, _ ...grpc.CallOption) (*csi.NodePublishVolumeResponse, error) {
@@ -73,15 +68,6 @@ func (f *fakeNodeClient) NodePublishVolume(ctx context.Context, req *csi.NodePub
 		f.onCall(ctx)
 	}
 	return f.resp, f.err
-}
-
-func (f *fakeNodeClient) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpublishVolumeRequest, _ ...grpc.CallOption) (*csi.NodeUnpublishVolumeResponse, error) {
-	f.unpublishCalls.Add(1)
-	f.gotUnpublishReq = req
-	if f.onUnpublishCall != nil {
-		f.onUnpublishCall(ctx)
-	}
-	return f.unpublishResp, f.unpublishErr
 }
 
 // withClientFactory swaps newClientFn for the duration of fn.
@@ -221,50 +207,6 @@ func TestRunNodePublishVolumePreservesParentDeadline(t *testing.T) {
 	err := RunNodePublishVolume(ctx, "fake.csi.example.com", csi.NodePublishVolumeRequest{}, false)
 	assert.NoError(t, err)
 	assert.Equal(t, int32(1), fake.calls.Load())
-}
-
-func TestRunNodeUnpublishVolume(t *testing.T) {
-	fake := &fakeNodeClient{
-		unpublishResp: &csi.NodeUnpublishVolumeResponse{},
-		onUnpublishCall: func(ctx context.Context) {
-			deadline, ok := ctx.Deadline()
-			assert.True(t, ok, "NodeUnpublishVolume must have a bounded deadline")
-			assert.False(t, deadline.IsZero())
-		},
-	}
-	closer := &nopCloser{}
-	withClientFactory(t, func(socketPath string) (csi.NodeClient, io.Closer, error) {
-		assert.Equal(t, path.Join(CsiSocketDir, "fake.csi.example.com", CsiSocketFile), socketPath)
-		return fake, closer, nil
-	})
-
-	err := RunNodeUnpublishVolume(context.Background(), "fake.csi.example.com", csi.NodePublishVolumeRequest{
-		VolumeId:   "vol-1",
-		TargetPath: "/run/csi/mount-root/fake/target",
-	})
-
-	assert.NoError(t, err)
-	assert.Equal(t, int32(1), fake.unpublishCalls.Load())
-	if assert.NotNil(t, fake.gotUnpublishReq) {
-		assert.Equal(t, "vol-1", fake.gotUnpublishReq.VolumeId)
-		assert.Equal(t, "/run/csi/mount-root/fake/target", fake.gotUnpublishReq.TargetPath)
-	}
-	assert.True(t, closer.closed.Load())
-}
-
-func TestRunNodeUnpublishVolumeReportsRPCError(t *testing.T) {
-	fake := &fakeNodeClient{unpublishErr: errors.New("target is busy")}
-	withClientFactory(t, func(string) (csi.NodeClient, io.Closer, error) {
-		return fake, &nopCloser{}, nil
-	})
-
-	err := RunNodeUnpublishVolume(context.Background(), "fake.csi.example.com", csi.NodePublishVolumeRequest{
-		VolumeId:   "vol-1",
-		TargetPath: "/target",
-	})
-
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), `NodeUnpublishVolume failed for driver "fake.csi.example.com"`)
 }
 
 // TestNewCSIClient exercises the real grpc.Dial path. Dial is lazy in gRPC,

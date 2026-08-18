@@ -483,19 +483,29 @@ func (sc *Controller) csiMountOptionsConfigRecord(ctx context.Context, sbx infra
 	sbx.SetAnnotations(annotations)
 }
 
-// buildCSIMountOptions carries the user intent to the infrastructure layer.
-// Kubernetes object resolution deliberately happens inside sandbox-manager's
-// infrastructure implementation so the API layer does not bypass the
-// API -> Manager -> Infra boundary.
-func (sc *Controller) buildCSIMountOptions(_ context.Context, request models.NewSandboxRequest) (*config.CSIMountOptions, error) {
+// buildCSIMountOptions builds CSI mount options from the request's CSI mount
+// configurations. Returns nil if no mounts are configured.
+func (sc *Controller) buildCSIMountOptions(ctx context.Context, request models.NewSandboxRequest) (*config.CSIMountOptions, error) {
 	if len(request.Extensions.CSIMount.MountConfigs) == 0 {
 		return nil, nil
 	}
-	raw, err := json.Marshal(request.Extensions.CSIMount.MountConfigs)
-	if err != nil {
-		return nil, fmt.Errorf("marshal CSI mount configs: %w", err)
+
+	csiMountOptions := make([]config.MountConfig, 0, len(request.Extensions.CSIMount.MountConfigs))
+	csiClient := csiutils.NewCSIMountHandler(sc.cache.GetClient(), sc.cache.GetAPIReader(), sc.storageRegistry, utils.DefaultSandboxDeployNamespace)
+	for _, mountConfig := range request.Extensions.CSIMount.MountConfigs {
+		driverName, publishRequest, err := csiClient.GenerateNodePublishVolumeRequest(ctx, mountConfig)
+		if err != nil {
+			return nil, err
+		}
+		csiMountOptions = append(csiMountOptions, config.MountConfig{
+			Driver:         driverName,
+			PublishRequest: publishRequest,
+		})
 	}
-	return &config.CSIMountOptions{MountOptionListRaw: string(raw)}, nil
+
+	return &config.CSIMountOptions{
+		MountOptionList: csiMountOptions,
+	}, nil
 }
 
 // injectStorageAuthAnnotation injects the storage-auth annotation into the sandbox

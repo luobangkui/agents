@@ -45,7 +45,6 @@ import (
 	"github.com/openkruise/agents/pkg/sandbox-manager/infra"
 	"github.com/openkruise/agents/pkg/sandboxid"
 	"github.com/openkruise/agents/pkg/sandboxroute"
-	"github.com/openkruise/agents/pkg/utils/csiutils"
 	"github.com/openkruise/agents/pkg/utils/expectations"
 	"github.com/openkruise/agents/pkg/utils/runtime"
 	utestutils "github.com/openkruise/agents/pkg/utils/testutils"
@@ -79,43 +78,6 @@ func createTestSandbox(name, user string, phase v1alpha1.SandboxPhase, ready boo
 	}
 
 	return sbx
-}
-
-func TestClassifyCSIMountResolveError(t *testing.T) {
-	tests := []struct {
-		name string
-		err  error
-		want managererrors.ErrorCode
-	}{
-		{
-			name: "missing referenced PV is bad request",
-			err: &csiutils.StorageReadError{
-				Resource: "persistent volume",
-				Key:      client.ObjectKey{Name: "missing"},
-				Err:      apierrors.NewNotFound(corev1.Resource("persistentvolumes"), "missing"),
-			},
-			want: managererrors.ErrorBadRequest,
-		},
-		{
-			name: "transient storage read is internal",
-			err: &csiutils.StorageReadError{
-				Resource: "persistent volume",
-				Key:      client.ObjectKey{Name: "pv"},
-				Err:      apierrors.NewServiceUnavailable("cache unavailable"),
-			},
-			want: managererrors.ErrorInternal,
-		},
-		{
-			name: "semantic provider error is bad request",
-			err:  errors.New("mountServiceID is required"),
-			want: managererrors.ErrorBadRequest,
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			require.Equal(t, tt.want, managererrors.GetErrCode(classifyCSIMountResolveError(tt.err)))
-		})
-	}
 }
 
 //goland:noinspection GoDeprecation

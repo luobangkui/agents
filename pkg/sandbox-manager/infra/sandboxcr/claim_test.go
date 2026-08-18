@@ -483,7 +483,6 @@ func TestInfra_ClaimSandbox(t *testing.T) {
 				CSIMount: &config.CSIMountOptions{
 					MountOptionList: []config.MountConfig{
 						{
-							Driver:         "test-driver",
 							PublishRequest: &csi.NodePublishVolumeRequest{VolumeId: "test-volume", TargetPath: "/mnt/data"},
 						},
 					},
@@ -772,7 +771,6 @@ func TestClaimSandboxFailed(t *testing.T) {
 		preModifier            func(sbx *v1alpha1.Sandbox)
 		expectError            string
 		expectDeleted          bool
-		expectReserved         bool
 		expectShutdown         bool
 		expectExistingShutdown *metav1.Time
 		getContext             func() context.Context
@@ -875,7 +873,6 @@ func TestClaimSandboxFailed(t *testing.T) {
 				CSIMount: &config.CSIMountOptions{
 					MountOptionList: []config.MountConfig{
 						{
-							Driver:         "test-driver",
 							PublishRequest: &csi.NodePublishVolumeRequest{VolumeId: "test-volume", TargetPath: "/mnt/data"},
 						},
 					},
@@ -888,7 +885,7 @@ func TestClaimSandboxFailed(t *testing.T) {
 			expectError: "command failed",
 		},
 		{
-			name: "csi mount failed, incomplete cleanup overrides deletion",
+			name: "csi mount failed, not reserved",
 			options: infra.ClaimSandboxOptions{
 				User:                    "test-user",
 				Template:                existTemplate,
@@ -897,7 +894,6 @@ func TestClaimSandboxFailed(t *testing.T) {
 				CSIMount: &config.CSIMountOptions{
 					MountOptionList: []config.MountConfig{
 						{
-							Driver:         "test-driver",
 							PublishRequest: &csi.NodePublishVolumeRequest{VolumeId: "test-volume", TargetPath: "/mnt/data"},
 						},
 					},
@@ -907,8 +903,8 @@ func TestClaimSandboxFailed(t *testing.T) {
 				sbx.Annotations[v1alpha1.AnnotationRuntimeURL] = server.URL
 				sbx.Annotations[v1alpha1.AnnotationRuntimeAccessToken] = runtime.AccessToken
 			},
-			expectError:    "command failed",
-			expectReserved: true,
+			expectError:   "command failed",
+			expectDeleted: true,
 		},
 		{
 			name: "context canceled",
@@ -1017,8 +1013,7 @@ func TestClaimSandboxFailed(t *testing.T) {
 				assert.Equal(t, v1alpha1.True, got.Labels[v1alpha1.LabelSandboxReservedFailed])
 			} else {
 				assert.Nil(t, got.Spec.ShutdownTime)
-				if tt.expectReserved ||
-					(tt.options.ReserveFailedSandboxFor != nil && *tt.options.ReserveFailedSandboxFor == consts.ReserveFailedSandboxForever) {
+				if tt.options.ReserveFailedSandboxFor != nil && *tt.options.ReserveFailedSandboxFor == consts.ReserveFailedSandboxForever {
 					assert.Equal(t, v1alpha1.True, got.Labels[v1alpha1.LabelSandboxReservedFailed])
 				}
 			}
@@ -1058,20 +1053,6 @@ func TestClearFailedSandboxReserveUpdateFailureDeletesSandbox(t *testing.T) {
 			assert.True(t, apierrors.IsNotFound(err))
 		})
 	}
-}
-
-func TestClearFailedSandboxNeverDeletesIncompleteDynamicMountCleanup(t *testing.T) {
-	sbx := createTestSandboxWithDefaults("test-sbx", "default")
-	testCache, fc := newRetryUpdateTestCache(t, sbx, sbx.DeepCopy(), nil)
-
-	clearFailedSandbox(t.Context(), AsSandbox(sbx, testCache),
-		&dynamicMountCleanupIncompleteError{err: errors.New("node unpublish unavailable")},
-		ptr.To(time.Duration(0)), nil, "")
-
-	got := &v1alpha1.Sandbox{}
-	require.NoError(t, fc.Get(t.Context(), client.ObjectKeyFromObject(sbx), got))
-	require.Equal(t, v1alpha1.True, got.Labels[v1alpha1.LabelSandboxReservedFailed])
-	require.Nil(t, got.Spec.ShutdownTime)
 }
 
 func TestReserveFailedSandboxRejectsUnsupportedType(t *testing.T) {
@@ -4019,25 +4000,6 @@ func TestModifyPickedSandbox_InitRuntime(t *testing.T) {
 			}
 		})
 	}
-}
-
-func TestModifyPickedSandboxRecordsDirectCSIUnmountIdentity(t *testing.T) {
-	sbx := &Sandbox{Sandbox: &v1alpha1.Sandbox{ObjectMeta: metav1.ObjectMeta{
-		Name: "test-sandbox", Namespace: "default", Annotations: map[string]string{},
-	}}}
-	err := modifyPickedSandbox(sbx, infra.LockTypeUpdate, infra.ClaimSandboxOptions{
-		CSIMount: &config.CSIMountOptions{MountOptionList: []config.MountConfig{{
-			Driver: "direct.test.csi",
-			PublishRequest: &csi.NodePublishVolumeRequest{
-				VolumeId: "volume-a", TargetPath: "/workspace/data",
-				Secrets: map[string]string{"token": "must-not-be-persisted"},
-			},
-		}}},
-	})
-	require.NoError(t, err)
-	record := sbx.Annotations[v1alpha1.AnnotationCSIDirectUnmountRecords]
-	require.NotEmpty(t, record)
-	require.NotContains(t, record, "must-not-be-persisted")
 }
 
 // TestNewSandboxFromSandboxSet_TemplateRef covers the SandboxTemplate

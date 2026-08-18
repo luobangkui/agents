@@ -144,22 +144,22 @@ func Initialize(ctx context.Context, box *agentsv1alpha1.Sandbox, newStatus *age
 		csiMountHandler := csimountutils.NewCSIMountHandler(client, apiReader, storageRegistry, utils.DefaultSandboxDeployNamespace)
 
 		// Resolve all CSIMountConfig annotations into MountConfig (driver + publish request)
-		mountOpts := config.CSIMountOptions{}
+		var mountOptionList []config.MountConfig
 		for _, req := range csiMountConfigRequests {
-			plan, genErr := csiMountHandler.GenerateMountPlan(ctx, req)
+			driverName, publishRequest, genErr := csiMountHandler.GenerateNodePublishVolumeRequest(ctx, req)
 			if genErr != nil {
-				return fmt.Errorf("failed to generate csi mount options config for sandbox: %w", genErr)
+				return fmt.Errorf("failed to generate csi mount options config for sandbox, err: %v", genErr)
 			}
-			if genErr = mountOpts.AppendMountPlan(plan); genErr != nil {
-				return genErr
-			}
+			mountOptionList = append(mountOptionList, config.MountConfig{
+				Driver:         driverName,
+				PublishRequest: publishRequest,
+			})
 		}
 
 		// Cleanup ProcessCSIMounts for concurrent mount execution
-		if len(mountOpts.StagedMountOptionList) > 0 {
-			return fmt.Errorf("staged CSI mounts must be restored by the kubelet-anchor lifecycle before runtime reinitialization")
-		}
-		duration, mountErr := utilruntime.ProcessCSIMounts(ctx, sbxForInit, mountOpts, rtOpts...)
+		duration, mountErr := utilruntime.ProcessCSIMounts(ctx, sbxForInit, config.CSIMountOptions{
+			MountOptionList: mountOptionList,
+		}, rtOpts...)
 		if mountErr != nil {
 			return fmt.Errorf("failed to perform ReCSIMount after resume: %w", mountErr)
 		}
