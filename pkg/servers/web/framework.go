@@ -31,6 +31,9 @@ import (
 	"github.com/openkruise/agents/pkg/utils"
 )
 
+// RawBody is an explicitly bounded binary response, not JSON base64.
+type RawBody []byte
+
 type Handler[T any] func(r *http.Request) (response ApiResponse[T], err *ApiError)
 
 type MiddleWare func(ctx context.Context, r *http.Request) (context.Context, *ApiError)
@@ -185,6 +188,16 @@ func writeJson(ctx context.Context, w http.ResponseWriter, code, defaultCode int
 	w.Header().Set("Content-Type", "application/json")
 	for k, v := range headers {
 		w.Header().Set(k, v)
+	}
+	if raw, ok := body.(RawBody); ok {
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.WriteHeader(code)
+		if code != http.StatusNoContent {
+			if _, err := w.Write(raw); err != nil {
+				log.Error(err, "Failed to write binary response")
+			}
+		}
+		return
 	}
 	w.WriteHeader(code)
 	if code == http.StatusNoContent {

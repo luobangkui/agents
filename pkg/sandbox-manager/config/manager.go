@@ -43,6 +43,7 @@ type QuotaOptions struct {
 }
 
 type SandboxManagerOptions struct {
+	KataServiceBindings   []KataServiceBinding
 	SystemNamespace       string
 	PeerSelector          string
 	SandboxNamespace      string

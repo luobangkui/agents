@@ -1,0 +1,6 @@
+{
+  "taskarena-removal-proof.patch": "a2e9879f060ff29f959ad44660334e06d7c7b86e83d12134e81a4b7a649e29cf",
+  "taskarena-agent-ctl.patch": "358cc9753faf687aa8bcf552f4d726931700829d1cf04bccc122d244fbb69814",
+  "upstream-13826.patch": "3c3c42e16c858574d83d9ea8fa0b74be70f9b57406c68b7c8b1463b266c0f813",
+  "taskarena-guest-proof.patch": "5f3c2e5c2f39063b5fd1bed8705ffcca9b009e254968c8bdc57f49ec36e37563"
+}

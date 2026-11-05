@@ -50,6 +50,8 @@ func (sc *Controller) registerRoutes() {
 	// Prometheus metrics endpoint for exporting metrics
 	sc.mux.Handle("GET /metrics", promhttp.HandlerFor(metrics.Registry, promhttp.HandlerOpts{}))
 
+	sc.registerSandboxServiceRoutes()
+
 	// Sandbox management endpoints
 	RegisterE2BRoute(sc.mux, http.MethodPost, "/sandboxes", sc.CreateSandbox, sc.CheckApiKey)
 	RegisterE2BRoute(sc.mux, http.MethodGet, "/v2/sandboxes", sc.ListSandboxes, sc.CheckApiKey)

@@ -167,7 +167,12 @@ func main() {
 	opts.BindFlags(flag.CommandLine)
 	klog.InitFlags(nil)
 	pflag.CommandLine.AddGoFlagSet(flag.CommandLine)
+	kataBindingsPath := pflag.String("kata-service-bindings", "", "operator-owned strict Kata supervisor bindings JSON; empty disables profile")
 	pflag.Parse()
+	kataBindings, err := config.LoadKataServiceBindings(*kataBindingsPath)
+	if err != nil {
+		klog.Fatalf("Invalid strict Kata service bindings: %v", err)
+	}
 
 	klog.SetLogger(zap.New(
 		zap.UseFlagOptions(&opts),
@@ -334,6 +339,7 @@ func main() {
 		KeyConfig:        keyCfg,
 		Manager: config.SandboxManagerOptions{
 			SystemNamespace:       sysNs,
+			KataServiceBindings:   kataBindings,
 			PeerSelector:          peerSelector,
 			SandboxNamespace:      sandboxNamespace,
 			SandboxLabelSelector:  sandboxLabelSelector,

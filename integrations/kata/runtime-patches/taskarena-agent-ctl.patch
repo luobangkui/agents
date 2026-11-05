@@ -1,0 +1,35 @@
+--- a/src/tools/agent-ctl/src/client.rs
++++ b/src/tools/agent-ctl/src/client.rs
+@@ -261,6 +261,11 @@
+         fp: agent_cmd_container_start,
+     },
+     AgentCmd {
++        name: "GetDiagnosticData",
++        st: ServiceType::Agent,
++        fp: agent_cmd_taskarena_diagnostic,
++    },
++    AgentCmd {
+         name: "StatsContainer",
+         st: ServiceType::Agent,
+         fp: agent_cmd_container_stats,
+@@ -1181,6 +1186,20 @@
+     info!(sl!(), "response received";
+         "response" => format!("{:?}", reply));
+ 
++    Ok(())
++}
++
++fn agent_cmd_taskarena_diagnostic(
++    ctx: &Context,
++    client: &AgentServiceClient,
++    _health: &HealthClient,
++    _options: &mut Options,
++    args: &str,
++) -> Result<()> {
++    let req: GetDiagnosticDataRequest = utils::make_request(args)?;
++    let reply = client.get_diagnostic_data(clone_context(ctx), &req)
++        .map_err(|e| anyhow!("{:?}", e).context(ERR_API_FAILED))?;
++    println!("TASKARENA_PROOF={}", reply.data);
+     Ok(())
+ }
+ 
