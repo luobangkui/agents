@@ -1,0 +1,206 @@
+From 295e7d7067cbf31da5bbdf76c1167caca156ae2d Mon Sep 17 00:00:00 2001
+From: Glim Data <glimdata@gmail.com>
+Date: Sun, 13 Sep 2026 16:55:24 +0100
+Subject: [PATCH 1/3] genpolicy: Allow a pids limit in CreateContainer requests
+
+The pids block is about to be forwarded to the guest like the CPU and
+memory blocks are. Stop requiring it to be null, so that a container
+with an OCI pids limit is still admitted by the default policy.
+
+Generated-By: Claude Code
+Signed-off-by: Glim Data <glimdata@gmail.com>
+---
+ src/tools/genpolicy/rules.rego | 1 -
+ 1 file changed, 1 deletion(-)
+
+diff --git a/src/tools/genpolicy/rules.rego b/src/tools/genpolicy/rules.rego
+index 59912766b9d4..5584fcf2ecb7 100644
+--- a/src/tools/genpolicy/rules.rego
++++ b/src/tools/genpolicy/rules.rego
+@@ -151,7 +151,6 @@ allow_create_container_input if {
+     is_null(i_linux.IntelRdt)
+     is_null(i_linux.Resources.BlockIO)
+     is_null(i_linux.Resources.Network)
+-    is_null(i_linux.Resources.Pids)
+     is_null(i_linux.Seccomp)
+ 
+     i_process := i_oci.Process
+
+From a0618837804ba3795cfd2f01be466f8019d3c356 Mon Sep 17 00:00:00 2001
+From: Glim Data <glimdata@gmail.com>
+Date: Sun, 13 Sep 2026 16:55:24 +0100
+Subject: [PATCH 2/3] protocols: Copy the pids block when it is present, not
+ when it is absent
+
+The grpc-to-OCI conversion of LinuxResources copied Pids under the
+inverted condition, so a limit sent by the runtime was dropped and an
+absent one became a LinuxPids with limit 0. Use the same positive check
+as the other resource blocks, and add a round-trip test.
+
+Generated-By: Claude Code
+Signed-off-by: Glim Data <glimdata@gmail.com>
+---
+ src/libs/protocols/src/trans.rs | 20 +++++++++++++++++++-
+ 1 file changed, 19 insertions(+), 1 deletion(-)
+
+diff --git a/src/libs/protocols/src/trans.rs b/src/libs/protocols/src/trans.rs
+index b8e2c6e2322c..a1461f405a28 100644
+--- a/src/libs/protocols/src/trans.rs
++++ b/src/libs/protocols/src/trans.rs
+@@ -751,7 +751,7 @@ impl From<grpc::LinuxResources> for oci::LinuxResources {
+         if resources.has_CPU() {
+             oci_resources.set_cpu(Some(resources.CPU().clone().into()));
+         }
+-        if !resources.has_Pids() {
++        if resources.has_Pids() {
+             oci_resources.set_pids(Some(resources.Pids().clone().into()));
+         }
+         if resources.has_BlockIO() {
+@@ -1249,6 +1249,7 @@ mod tests {
+     use std::collections::HashSet;
+ 
+     use super::cap_vec2hashset;
++    use super::grpc;
+     use super::oci;
+ 
+     fn from_vec<F: Sized, T: From<F>>(from: Vec<F>) -> Vec<T> {
+@@ -1285,6 +1286,23 @@ mod tests {
+         assert_eq!(from.from, to.to);
+     }
+ 
++    #[test]
++    fn test_linux_resources_round_trip_keeps_pids() {
++        let pids = oci::LinuxPidsBuilder::default().limit(8).build().unwrap();
++        let resources = oci::LinuxResourcesBuilder::default()
++            .pids(pids)
++            .build()
++            .unwrap();
++
++        let grpc_resources: grpc::LinuxResources = resources.into();
++        assert!(grpc_resources.has_Pids());
++        let back: oci::LinuxResources = grpc_resources.into();
++        assert_eq!(back.pids().as_ref().unwrap().limit(), 8);
++
++        let without: oci::LinuxResources = grpc::LinuxResources::default().into();
++        assert!(without.pids().is_none());
++    }
++
+     #[test]
+     fn test_from_vec_len_0() {
+         let from: Vec<TestA> = vec![];
+
+From c02a55b3d06851b9e496f4cff637d99c6af9c81a Mon Sep 17 00:00:00 2001
+From: Glim Data <glimdata@gmail.com>
+Date: Sun, 13 Sep 2026 16:55:24 +0100
+Subject: [PATCH 3/3] runtime-rs: Keep the OCI pids limit in the spec sent to
+ the guest
+
+The container create path cleared linux.resources.pids together with
+devices, block I/O and network before the spec reached the agent, so
+pids.max was never applied in the guest and a fork storm was bounded
+only by the VM size. The agent's cgroup manager applies the limit when
+the block is present, so keep it, and move the clearing of the other
+blocks into a function with a test.
+
+Fixes: #13824
+
+Generated-By: Claude Code
+Signed-off-by: Glim Data <glimdata@gmail.com>
+---
+ .../src/container_manager/container.rs        | 69 ++++++++++++++++---
+ 1 file changed, 59 insertions(+), 10 deletions(-)
+
+diff --git a/src/runtime-rs/crates/runtimes/virt_container/src/container_manager/container.rs b/src/runtime-rs/crates/runtimes/virt_container/src/container_manager/container.rs
+index 1d272e2dd5a9..0c2858bde2a9 100644
+--- a/src/runtime-rs/crates/runtimes/virt_container/src/container_manager/container.rs
++++ b/src/runtime-rs/crates/runtimes/virt_container/src/container_manager/container.rs
+@@ -222,16 +222,7 @@ impl Container {
+             .await?;
+         if let Some(linux) = &mut spec.linux_mut() {
+             linux.set_resources(resources);
+-
+-            // Only CPU and Memory constraints are supported in the guest.
+-            // Clear unsupported resource fields to match the Go runtime
+-            // and satisfy the agent policy checks.
+-            if let Some(resource) = linux.resources_mut() {
+-                resource.set_devices(None);
+-                resource.set_pids(None);
+-                resource.set_block_io(None);
+-                resource.set_network(None);
+-            }
++            strip_unsupported_resources(linux);
+ 
+             // VFIO device filtering depends on vfio_mode configuration:
+             //
+@@ -880,6 +871,16 @@ fn is_pid_namespace_enabled(spec: &oci::Spec) -> bool {
+     false
+ }
+ 
++/// Keep the resource constraints the guest applies (CPU, memory and pids)
++/// and clear the rest, which the agent policy checks expect to be absent.
++fn strip_unsupported_resources(linux: &mut oci::Linux) {
++    if let Some(resource) = linux.resources_mut() {
++        resource.set_devices(None);
++        resource.set_block_io(None);
++        resource.set_network(None);
++    }
++}
++
+ /// Filter VFIO devices from the Linux device list based on vfio_mode configuration.
+ /// - vfio mode: Keeps all devices including /dev/vfio/*
+ /// - guest-kernel mode: Removes /dev/vfio/* devices as they're managed by guest kernel
+@@ -1067,6 +1068,54 @@ mod tests {
+         }
+     }
+ 
++    #[test]
++    fn test_strip_unsupported_resources_keeps_cpu_memory_and_pids() {
++        let resources = oci::LinuxResourcesBuilder::default()
++            .cpu(
++                oci::LinuxCpuBuilder::default()
++                    .quota(100000i64)
++                    .period(100000u64)
++                    .build()
++                    .unwrap(),
++            )
++            .memory(
++                oci::LinuxMemoryBuilder::default()
++                    .limit(1i64 << 30)
++                    .build()
++                    .unwrap(),
++            )
++            .pids(oci::LinuxPidsBuilder::default().limit(8).build().unwrap())
++            .block_io(
++                oci::LinuxBlockIoBuilder::default()
++                    .weight(10u16)
++                    .build()
++                    .unwrap(),
++            )
++            .network(
++                oci::LinuxNetworkBuilder::default()
++                    .class_id(1u32)
++                    .build()
++                    .unwrap(),
++            )
++            .devices(vec![oci::LinuxDeviceCgroup::default()])
++            .build()
++            .unwrap();
++        let mut linux = oci::LinuxBuilder::default()
++            .resources(resources)
++            .build()
++            .unwrap();
++
++        strip_unsupported_resources(&mut linux);
++
++        let resources = linux.resources().as_ref().unwrap();
++        assert!(resources.cpu().is_some());
++        assert!(resources.memory().is_some());
++        assert_eq!(resources.pids().as_ref().unwrap().limit(), 8);
++        assert!(resources.devices().is_none());
++        assert!(resources.block_io().is_none());
++        assert!(resources.network().is_none());
++    }
++
+     #[test]
+     fn test_filter_vfio_devices_guest_kernel_mode() {
+         // Test that VFIO devices are filtered out in guest-kernel mode

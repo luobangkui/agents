@@ -1,0 +1,96 @@
+--- a/src/agent/src/rpc.rs
++++ b/src/agent/src/rpc.rs
+@@ -710,6 +710,70 @@
+         ctr.processes.remove(&eid);
+ 
+         Ok(resp)
++    }
++
++    // This opt-in test RPC reads runtime-owned cgroups outside workload namespaces.
++    #[cfg(feature = "taskarena-audit")]
++    async fn do_read_taskarena_cgroup_proof(
++        &self,
++        container_id: &str,
++        challenge: &str,
++    ) -> Result<protocols::agent::GetDiagnosticDataResponse> {
++        if challenge.len() != 64 || !challenge.bytes().all(|c| c.is_ascii_hexdigit()) {
++            return Err(anyhow!("invalid audit challenge"));
++        }
++        let (manager, requested_limit) = {
++            let sandbox = self.sandbox.lock().await;
++            let ctr = sandbox.containers.get(container_id)
++                .ok_or_else(|| anyhow!("invalid audit container id"))?;
++            let requested_limit = ctr.config.spec.as_ref()
++                .and_then(|s| s.linux().as_ref())
++                .and_then(|l| l.resources().as_ref())
++                .and_then(|r| r.pids().as_ref())
++                .map(|p| p.limit());
++            (ctr.cgroup_manager.clone(), requested_limit)
++        };
++        let cid = container_id.to_string();
++        let nonce = challenge.to_string();
++        let data = tokio::task::spawn_blocking(move || -> Result<String> {
++            use std::os::unix::fs::MetadataExt;
++            let path = std::fs::canonicalize(manager.get_cgroup_path("pids")?)?;
++            if !path.starts_with("/sys/fs/cgroup") {
++                return Err(anyhow!("audit cgroup outside controller mount"));
++            }
++            // Missing controller files are an error, never an empty-process proof.
++            let read = |name: &str| -> Result<String> {
++                Ok(std::fs::read_to_string(path.join(name))?.trim().to_string())
++            };
++            let before = std::fs::metadata(&path)?;
++            let procs = read("cgroup.procs")?;
++            let events = read("cgroup.events")?;
++            let pids_max = read("pids.max")?;
++            let pids_current = read("pids.current")?.parse::<u64>()?;
++            let pids_events = read("pids.events")?;
++            let after = std::fs::metadata(&path)?;
++            if before.dev() != after.dev() || before.ino() != after.ino() {
++                return Err(anyhow!("audit cgroup identity changed"));
++            }
++            let processes = procs.split_whitespace().map(str::parse::<u32>)
++                .collect::<std::result::Result<Vec<_>, _>>()?;
++            let populated = events.lines().find_map(|line| line.strip_prefix("populated "))
++                .ok_or_else(|| anyhow!("missing cgroup populated state"))?.parse::<u8>()?;
++            if populated > 1 { return Err(anyhow!("invalid populated state")); }
++            let guest_boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
++            Ok(serde_json::json!({
++                "schema_version": 1, "source": "kata-agent-runtime-cgroup",
++                "container_id": cid, "challenge": nonce,
++                "guest_boot_id": guest_boot_id.trim(), "cgroup_path": path,
++                "cgroup_device": before.dev(), "cgroup_inode": before.ino(),
++                "requested_pid_limit": requested_limit, "pids_max": pids_max,
++                "pids_current": pids_current, "pids_events": pids_events,
++                "processes": processes, "populated": populated,
++                "observed_unix_ns": std::time::SystemTime::now()
++                    .duration_since(std::time::UNIX_EPOCH)?.as_nanos().to_string()
++            }).to_string())
++        }).await??;
++        Ok(protocols::agent::GetDiagnosticDataResponse { data, ..Default::default() })
+     }
+ 
+     async fn do_read_termination_log(
+@@ -1884,6 +1948,11 @@
+                 .do_read_termination_log(&req.container_id)
+                 .await
+                 .map_ttrpc_err(same),
++            #[cfg(feature = "taskarena-audit")]
++            kind if kind.starts_with("taskarena_cgroup_v1:") => self
++                .do_read_taskarena_cgroup_proof(&req.container_id, &kind["taskarena_cgroup_v1:".len()..])
++                .await
++                .map_ttrpc_err(same),
+             other => Err(ttrpc_error(
+                 ttrpc::Code::INVALID_ARGUMENT,
+                 format!("unsupported diagnostic log_type: {other}"),
+--- a/src/agent/Cargo.toml
++++ b/src/agent/Cargo.toml
+@@ -105,6 +105,8 @@
+ lto = true
+ 
+ [features]
++# Test-only runtime-owned cgroup proof endpoint.
++taskarena-audit = []
+ seccomp = ["rustjail/seccomp"]
+ agent-policy = ["kata-agent-policy"]
+ init-data = []

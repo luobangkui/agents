@@ -51,7 +51,12 @@ require (
 	sigs.k8s.io/controller-runtime v0.20.2
 )
 
-require go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.63.0 // indirect
+require (
+	github.com/gorilla/websocket v1.5.4-0.20250319132907-e064f32e3674 // indirect
+	github.com/moby/spdystream v0.5.0 // indirect
+	github.com/mxk/go-flowrate v0.0.0-20140419014527-cca7078d478f // indirect
+	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.63.0 // indirect
+)
 
 require (
 	cel.dev/expr v0.24.0 // indirect

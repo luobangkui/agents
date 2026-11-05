@@ -1,0 +1,134 @@
+--- a/src/agent/src/rpc.rs
++++ b/src/agent/src/rpc.rs
+@@ -242,6 +242,33 @@
+     oma: Option<mem_agent::agent::MemAgent>,
+ }
+ 
++#[cfg(feature = "taskarena-audit")]
++static TASKARENA_REMOVALS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, serde_json::Value>>> =
++    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
++
++#[cfg(feature = "taskarena-audit")]
++fn taskarena_is_empty(p: &serde_json::Value) -> bool {
++    p["pids_current"] == 0 && p["populated"] == 0
++        && p["processes"].as_array().is_some_and(|v| v.is_empty())
++}
++
++#[cfg(feature = "taskarena-audit")]
++fn taskarena_seal_removal(cid: &str, candidate: Option<serde_json::Value>) -> Result<()> {
++    let Some(mut p) = candidate else { return Ok(()); };
++    if !taskarena_is_empty(&p) { return Err(anyhow!("removal candidate was not empty")); }
++    let path = p["cgroup_path"].as_str().ok_or_else(|| anyhow!("missing cgroup path"))?;
++    // Successful destroy plus prior zero readings, never absence alone.
++    if std::path::Path::new(path).try_exists()? { return Err(anyhow!("cgroup survived destroy")); }
++    let at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos().to_string();
++    p["proof_state"] = serde_json::json!("cgroup_removed");
++    p["removal_confirmed"] = serde_json::json!(true);
++    p["removal_unix_ns"] = serde_json::json!(at);
++    let mut records = TASKARENA_REMOVALS.lock().map_err(|_| anyhow!("removal cache poisoned"))?;
++    if records.len() >= 256 { return Err(anyhow!("removal evidence capacity reached")); }
++    records.insert(cid.to_string(), p);
++    Ok(())
++}
++
+ impl AgentService {
+     #[instrument]
+     async fn do_create_container(
+@@ -259,6 +286,9 @@
+         let cid = req.container_id.clone();
+ 
+         kata_sys_util::validate::verify_id(&cid)?;
++        #[cfg(feature = "taskarena-audit")]
++        TASKARENA_REMOVALS.lock().map_err(|_| anyhow!("removal cache poisoned"))?.remove(&cid);
++
+ 
+         let use_sandbox_pidns = req.sandbox_pidns();
+ 
+@@ -447,6 +477,8 @@
+         req: protocols::agent::RemoveContainerRequest,
+     ) -> Result<()> {
+         let cid = req.container_id;
++        #[cfg(feature = "taskarena-audit")]
++        let audit_candidate = self.taskarena_empty_before_remove(&cid).await;
+ 
+         // Drop the host guest mapping for this container so we can reuse the
+         // PCI slots for the next containers
+@@ -460,6 +492,10 @@
+                 .destroy()
+                 .await?;
+             remove_container_resources(&mut sandbox, &cid).await?;
++            #[cfg(feature = "taskarena-audit")]
++            if let Err(e) = taskarena_seal_removal(&cid, audit_candidate) {
++                warn!(sl(), "failed to seal removal evidence: {}", e);
++            }
+             return Ok(());
+         }
+ 
+@@ -481,7 +517,12 @@
+             .await
+             .map_err(|_| anyhow!(nix::Error::ETIME))???;
+ 
+-        remove_container_resources(&mut *self.sandbox.lock().await, &cid).await
++        remove_container_resources(&mut *self.sandbox.lock().await, &cid).await?;
++        #[cfg(feature = "taskarena-audit")]
++        if let Err(e) = taskarena_seal_removal(&cid, audit_candidate) {
++            warn!(sl(), "failed to seal removal evidence: {}", e);
++        }
++        Ok(())
+     }
+ 
+     #[instrument]
+@@ -712,6 +753,28 @@
+         Ok(resp)
+     }
+ 
++    #[cfg(feature = "taskarena-audit")]
++    async fn taskarena_empty_before_remove(&self, cid: &str) -> Option<serde_json::Value> {
++        let challenge = "0".repeat(64);
++        for _ in 0..20 {
++            let first = self.do_read_taskarena_cgroup_proof(cid, &challenge).await.ok()?;
++            let first: serde_json::Value = serde_json::from_str(&first.data).ok()?;
++            if taskarena_is_empty(&first) {
++                tokio::time::sleep(Duration::from_millis(10)).await;
++                let second = self.do_read_taskarena_cgroup_proof(cid, &challenge).await.ok()?;
++                let mut second: serde_json::Value = serde_json::from_str(&second.data).ok()?;
++                if taskarena_is_empty(&second) && ["cgroup_inode", "cgroup_device", "cgroup_path", "guest_boot_id"]
++                    .iter().all(|k| first[*k] == second[*k]) {
++                    second["prior_empty_observed_unix_ns"] = first["observed_unix_ns"].clone();
++                    second["empty_samples"] = serde_json::json!(2);
++                    return Some(second);
++                }
++            }
++            tokio::time::sleep(Duration::from_millis(10)).await;
++        }
++        None
++    }
++
+     // This opt-in test RPC reads runtime-owned cgroups outside workload namespaces.
+     #[cfg(feature = "taskarena-audit")]
+     async fn do_read_taskarena_cgroup_proof(
+@@ -721,6 +784,15 @@
+     ) -> Result<protocols::agent::GetDiagnosticDataResponse> {
+         if challenge.len() != 64 || !challenge.bytes().all(|c| c.is_ascii_hexdigit()) {
+             return Err(anyhow!("invalid audit challenge"));
++        }
++        if let Some(mut proof) = TASKARENA_REMOVALS.lock()
++            .map_err(|_| anyhow!("removal cache poisoned"))?.get(container_id).cloned() {
++            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos();
++            let removed = proof["removal_unix_ns"].as_str().ok_or_else(|| anyhow!("missing removal time"))?.parse::<u128>()?;
++            if now < removed || now - removed > 600_000_000_000 { return Err(anyhow!("expired removal evidence")); }
++            proof["challenge"] = serde_json::json!(challenge);
++            proof["response_unix_ns"] = serde_json::json!(now.to_string());
++            return Ok(protocols::agent::GetDiagnosticDataResponse { data: proof.to_string(), ..Default::default() });
+         }
+         let (manager, requested_limit) = {
+             let sandbox = self.sandbox.lock().await;
+@@ -762,7 +834,7 @@
+             if populated > 1 { return Err(anyhow!("invalid populated state")); }
+             let guest_boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
+             Ok(serde_json::json!({
+-                "schema_version": 1, "source": "kata-agent-runtime-cgroup",
++                "schema_version": 1, "source": "kata-agent-runtime-cgroup", "proof_state": "live",
+                 "container_id": cid, "challenge": nonce,
+                 "guest_boot_id": guest_boot_id.trim(), "cgroup_path": path,
+                 "cgroup_device": before.dev(), "cgroup_inode": before.ino(),

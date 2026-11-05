@@ -27,6 +27,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/client-go/rest"
 	"k8s.io/klog/v2"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -63,6 +64,9 @@ func NewInfraBuilder(opts config.SandboxManagerOptions) *InfraBuilder {
 	return &InfraBuilder{
 		instance: &Infra{
 			claimLockChannel: make(chan struct{}, opts.MaxClaimWorkers),
+			serviceConfig:    opts.RestConfig,
+			kataServices:     append([]config.KataServiceBinding(nil), opts.KataServiceBindings...),
+			serviceSlots:     make(chan struct{}, 16),
 			createLimiter:    rate.NewLimiter(rate.Limit(opts.MaxCreateQPS), opts.MaxCreateQPS),
 		},
 	}
@@ -96,9 +100,12 @@ func (b *InfraBuilder) Build() infra.Infrastructure {
 }
 
 type Infra struct {
-	Cache     cache.Provider
-	APIReader client.Reader
-	Routes    infra.RouteReader
+	kataServices  []config.KataServiceBinding
+	serviceConfig *rest.Config
+	serviceSlots  chan struct{}
+	Cache         cache.Provider
+	APIReader     client.Reader
+	Routes        infra.RouteReader
 
 	// RuntimeTLSBundle is the client TLS bundle for reaching TLS-capable
 	// agent-runtimes; nil disables runtime TLS for this manager, so every
