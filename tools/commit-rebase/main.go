@@ -25,7 +25,9 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/containerd/containerd"
@@ -49,7 +51,9 @@ func main() {
 	if *image == "" {
 		fail("missing --image")
 	}
-	ctx := namespaces.WithNamespace(context.Background(), *namespace)
+	signalCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	ctx := namespaces.WithNamespace(signalCtx, *namespace)
 	client, err := containerd.New(*sock, containerd.WithDefaultNamespace(*namespace))
 	if err != nil {
 		fail("connect containerd: %v", err)
@@ -97,6 +101,12 @@ func hasNydusLayers(ctx context.Context, client *containerd.Client, ref string) 
 }
 
 func rebase(ctx context.Context, client *containerd.Client, committedRef, baseRef string) error {
+	return withRebaseLease(ctx, client.LeasesService(), func(ctx context.Context) error {
+		return rebaseContent(ctx, client, committedRef, baseRef)
+	})
+}
+
+func rebaseContent(ctx context.Context, client *containerd.Client, committedRef, baseRef string) error {
 	cs := client.ContentStore()
 	is := client.ImageService()
 
