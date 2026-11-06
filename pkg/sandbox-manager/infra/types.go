@@ -26,6 +26,7 @@ import (
 
 	"github.com/openkruise/agents/api/v1alpha1"
 	"github.com/openkruise/agents/pkg/sandbox-manager/config"
+	"github.com/openkruise/agents/pkg/utils/runtime"
 	"github.com/openkruise/agents/pkg/utils/timeout"
 )
 
@@ -37,6 +38,15 @@ type SaveTimeoutOptions struct {
 type SandboxAdmission struct {
 	Acquire func(ctx context.Context, lockString string, resource SandboxResource) error
 	Release func(ctx context.Context, lockString string) error
+}
+
+// StaticPVCMount is a protocol-neutral description of an existing PVC that
+// must be mounted into a freshly created sandbox.
+type StaticPVCMount struct {
+	ClaimName string `json:"claimName"`
+	MountPath string `json:"mountPath"`
+	SubPath   string `json:"subPath,omitempty"`
+	ReadOnly  bool   `json:"readOnly,omitempty"`
 }
 
 const SandboxAdmissionReleaseTimeout = 250 * time.Millisecond
@@ -52,10 +62,8 @@ type ClaimSandboxOptions struct {
 	// Lock string used in optimistic lock
 	LockString string            `json:"lockString"`
 	Admission  *SandboxAdmission `json:"-"`
-	// PreCheck checks the sandbox before modifying it
-	PreCheck func(sandbox Sandbox) error `json:"-"`
-	// Set Modifier to modify the Sandbox before it is updated
-	Modifier func(sandbox Sandbox) `json:"-"`
+	// Set Modifier to modify the Sandbox before it is updated. Returning an error aborts persistence.
+	Modifier func(sandbox Sandbox) error `json:"-"`
 	// ReserveFailedSandboxFor controls how long failed sandboxes are kept for debugging.
 	//   nil                          — backend default (DefaultReserveFailedSandboxFor)
 	//   ReserveFailedSandboxNever    — delete immediately
@@ -76,6 +84,12 @@ type ClaimSandboxOptions struct {
 	WaitReadyTimeout time.Duration `json:"waitReadyTimeout"`
 	// Create a Sandbox instance from the template if no available ones in SandboxSets
 	CreateOnNoStock bool `json:"createOnNoStock"`
+	// RequireFresh bypasses pooled and speculative candidates and creates a new
+	// Sandbox instance from the SandboxSet. It requires CreateOnNoStock.
+	RequireFresh bool `json:"requireFresh"`
+	// StaticPVCMounts are existing PVCs injected into the new Sandbox pod template.
+	// They are supported only together with RequireFresh.
+	StaticPVCMounts []StaticPVCMount `json:"staticPVCMounts,omitempty"`
 	// A creating sandbox lasts for SpeculateCreatingDuration may be picked as a candidate when no available ones in SandboxSets.
 	// Set to 0 to disable speculation feature
 	SpeculateCreatingDuration time.Duration `json:"speculateCreatingDuration"`
@@ -87,6 +101,20 @@ type ClaimSandboxOptions struct {
 	// non-CRD paths such as the E2B API. IdentityProvider implementations must
 	// handle a nil Claim gracefully.
 	Claim *v1alpha1.SandboxClaim `json:"-"`
+	// RuntimeTLSBundle is the client TLS bundle used to reach a TLS-capable
+	// agent-runtime during claim post-processing (init handshake and CSI
+	// mounts). Nil means the caller is not configured for runtime TLS, so a
+	// sandbox that already advertises the capability fails the claim instead of
+	// being downgraded to plaintext (see runtime.TransportOptionsFor).
+	//
+	// The field belongs to whoever drives the claim, never to API callers:
+	//   - through Infrastructure.ClaimSandbox it is unconditionally overwritten
+	//     with the Infra-owned bundle, so a value set by an API caller is
+	//     discarded (same contract as CloneSandboxOptions.CreateLimiter);
+	//   - callers invoking sandboxcr.TryClaimSandbox directly — currently the
+	//     SandboxClaim controller — bypass that overwrite and must set it
+	//     themselves.
+	RuntimeTLSBundle *runtime.TLSBundle `json:"-"`
 }
 
 type CloneSandboxOptions struct {
@@ -98,7 +126,7 @@ type CloneSandboxOptions struct {
 	WaitReadyTimeout   time.Duration           `json:"waitReadyTimeout"`
 	CloneTimeout       time.Duration           `json:"cloneTimeout"`
 	CSIMount           *config.CSIMountOptions `json:"CSIMount"`
-	Modifier           func(sbx Sandbox)       `json:"-"`
+	Modifier           func(sbx Sandbox) error `json:"-"`
 	CreateLimiter      *rate.Limiter           `json:"-"`
 	SkipWaitCheckpoint bool                    `json:"skipWaitCheckpoint"`
 	// See ReserveFailedSandboxFor on ClaimSandboxOptions.
@@ -109,6 +137,12 @@ type CloneSandboxOptions struct {
 	// GenerateName sets ObjectMeta.GenerateName on the cloned sandbox (prefix).
 	// Mutually exclusive with Name.
 	GenerateName string `json:"generateName,omitempty"`
+	// RuntimeTLSBundle is the client TLS bundle used to reach a TLS-capable
+	// agent-runtime during clone post-processing (re-init handshake and CSI
+	// mounts). Unconditionally overwritten by the Infrastructure implementation
+	// like CreateLimiter, so a value set by an API caller is discarded; nil
+	// means this process is not configured for runtime TLS.
+	RuntimeTLSBundle *runtime.TLSBundle `json:"-"`
 }
 
 type CreateCheckpointOptions struct {
@@ -207,6 +241,7 @@ type CloneMetrics struct {
 	WaitReady     time.Duration
 	InitRuntime   time.Duration
 	SecurityToken time.Duration
+	TrafficToken  time.Duration
 	CSIMount      time.Duration
 	Total         time.Duration
 	LastError     error
@@ -217,8 +252,8 @@ func (m *CloneMetrics) String() string {
 	if m.LastError != nil {
 		lastErrStr = sanitizeErrorMessage(m.LastError)
 	}
-	return fmt.Sprintf("CloneMetrics{Retries: %d, Wait: %v, GetTemplate: %v, CreateSandbox: %v, WaitReady: %v, InitRuntime: %v, SecurityToken: %v, CSIMount: %v, Total: %v, LastError: %v}",
-		m.Retries, m.Wait, m.GetTemplate, m.CreateSandbox, m.WaitReady, m.InitRuntime, m.SecurityToken, m.CSIMount, m.Total, lastErrStr)
+	return fmt.Sprintf("CloneMetrics{Retries: %d, Wait: %v, GetTemplate: %v, CreateSandbox: %v, WaitReady: %v, InitRuntime: %v, SecurityToken: %v, TrafficToken: %v, CSIMount: %v, Total: %v, LastError: %v}",
+		m.Retries, m.Wait, m.GetTemplate, m.CreateSandbox, m.WaitReady, m.InitRuntime, m.SecurityToken, m.TrafficToken, m.CSIMount, m.Total, lastErrStr)
 }
 
 // Merge accumulates per-attempt durations from src into m. Retries and
@@ -231,6 +266,7 @@ func (m *CloneMetrics) Merge(src CloneMetrics) {
 	m.WaitReady += src.WaitReady
 	m.InitRuntime += src.InitRuntime
 	m.SecurityToken += src.SecurityToken
+	m.TrafficToken += src.TrafficToken
 	m.CSIMount += src.CSIMount
 	m.Total += src.Total
 }

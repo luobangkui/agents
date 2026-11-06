@@ -127,6 +127,12 @@ func (sc *Controller) CreateSandbox(r *http.Request) (web.ApiResponse[*models.Sa
 		Namespace:    namespace,
 		CheckpointID: request.TemplateID,
 	}) {
+		if len(request.Extensions.StaticPVCMounts) > 0 {
+			return web.ApiResponse[*models.Sandbox]{}, &web.ApiError{
+				Code:    http.StatusBadRequest,
+				Message: "static PVC mounts are only supported when creating from a SandboxSet",
+			}
+		}
 		log.Info("infra has checkpoint, will create sandbox with clone", "templateID", request.TemplateID)
 		return sc.createSandboxWithClone(ctx, request, user, domain)
 	}
@@ -156,14 +162,27 @@ func (sc *Controller) createSandboxWithClaim(ctx context.Context, request models
 		Template:     request.TemplateID,
 		User:         user.ID.String(),
 		ClaimTimeout: resolveServerTimeout(request.Extensions.TimeoutSeconds),
-		Modifier: func(sbx infra.Sandbox) {
+		Modifier: func(sbx infra.Sandbox) error {
 			sc.basicSandboxCreateModifier(ctx, sbx, request)
 			sc.csiMountOptionsConfigRecord(ctx, sbx, request)
 			sc.injectStorageAuthAnnotation(sbx, storageAuthKey, storageAuthValue)
+			return nil
 		},
 		ReserveFailedSandboxFor: request.Extensions.ReserveFailedSandboxFor,
 		CreateOnNoStock:         request.Extensions.CreateOnNoStock,
 		UserMetadataKeys:        sandboxcr.BuildUserMetadataKeys(request.Extensions.Labels, request.Metadata),
+	}
+	if len(request.Extensions.StaticPVCMounts) > 0 {
+		infraOpts.RequireFresh = true
+		infraOpts.StaticPVCMounts = make([]infra.StaticPVCMount, 0, len(request.Extensions.StaticPVCMounts))
+		for _, mount := range request.Extensions.StaticPVCMounts {
+			infraOpts.StaticPVCMounts = append(infraOpts.StaticPVCMounts, infra.StaticPVCMount{
+				ClaimName: mount.ClaimName,
+				MountPath: mount.MountPath,
+				SubPath:   mount.SubPath,
+				ReadOnly:  mount.ReadOnly,
+			})
+		}
 	}
 
 	if !request.Extensions.SkipInitRuntime {
@@ -254,9 +273,10 @@ func (sc *Controller) createSandboxWithClone(ctx context.Context, request models
 		User:         user.ID.String(),
 		CheckPointID: request.TemplateID,
 		CloneTimeout: resolveServerTimeout(request.Extensions.TimeoutSeconds),
-		Modifier: func(sbx infra.Sandbox) {
+		Modifier: func(sbx infra.Sandbox) error {
 			sc.basicSandboxCreateModifier(ctx, sbx, request)
 			sc.injectStorageAuthAnnotation(sbx, storageAuthKey, storageAuthValue)
+			return nil
 		},
 		ReserveFailedSandboxFor: request.Extensions.ReserveFailedSandboxFor,
 		Name:                    request.Extensions.Name,
@@ -491,13 +511,13 @@ func (sc *Controller) buildCSIMountOptions(ctx context.Context, request models.N
 	csiMountOptions := make([]config.MountConfig, 0, len(request.Extensions.CSIMount.MountConfigs))
 	csiClient := csiutils.NewCSIMountHandler(sc.cache.GetClient(), sc.cache.GetAPIReader(), sc.storageRegistry, utils.DefaultSandboxDeployNamespace)
 	for _, mountConfig := range request.Extensions.CSIMount.MountConfigs {
-		driverName, csiReqConfigRaw, err := csiClient.CSIMountOptionsConfig(ctx, mountConfig)
+		driverName, publishRequest, err := csiClient.GenerateNodePublishVolumeRequest(ctx, mountConfig)
 		if err != nil {
 			return nil, err
 		}
 		csiMountOptions = append(csiMountOptions, config.MountConfig{
-			Driver:     driverName,
-			RequestRaw: csiReqConfigRaw,
+			Driver:         driverName,
+			PublishRequest: publishRequest,
 		})
 	}
 
@@ -535,10 +555,10 @@ func createNetworkPolicyForSandbox(ctx context.Context, sbx infra.Sandbox, reque
 		log.Error(netErr, "failed to create network policy, sandbox creation failed",
 			"sandboxID", sbx.GetSandboxID())
 		killed := killSandboxAfterFailure(ctx, sbx, log)
-		return &web.ApiError{
+		return withSandboxResourceContext(&web.ApiError{
 			Code:    http.StatusInternalServerError,
 			Message: fmt.Sprintf("failed to create network policy: %v; clean up sandbox: %v", netErr, killed),
-		}
+		}, sbx)
 	}
 	return nil
 }

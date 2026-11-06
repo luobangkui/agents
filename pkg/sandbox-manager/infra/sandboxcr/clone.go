@@ -37,8 +37,12 @@ import (
 	"github.com/openkruise/agents/pkg/sandbox-manager/consts"
 	managererrors "github.com/openkruise/agents/pkg/sandbox-manager/errors"
 	"github.com/openkruise/agents/pkg/sandbox-manager/infra"
+	"github.com/openkruise/agents/pkg/sandboxid"
+	"github.com/openkruise/agents/pkg/tracing"
 	"github.com/openkruise/agents/pkg/utils"
 	"github.com/openkruise/agents/pkg/utils/runtime"
+
+	"go.opentelemetry.io/otel/attribute"
 )
 
 var (
@@ -77,6 +81,12 @@ func ValidateAndInitCheckpointOptions(opts infra.CreateCheckpointOptions) infra.
 }
 
 func CloneSandbox(ctx context.Context, opts infra.CloneSandboxOptions, cache infracache.Provider) (cloned infra.Sandbox, metrics infra.CloneMetrics, err error) {
+	ctx, span := tracing.StartManagerSpan(ctx, tracing.SpanInfraCloneSandbox,
+		attribute.String(tracing.AttrCloneCheckpointID, opts.CheckPointID),
+	)
+	// Keep the closure: a direct defer tracing.EndSpan(ctx, span, err) would
+	// evaluate err while still nil and record every failure as success.
+	defer func() { tracing.EndSpan(ctx, span, err) }()
 	log := klog.FromContext(ctx).WithValues("checkpointID", opts.CheckPointID)
 	opts.LockString = chooseLockString(opts.Admission, opts.LockString)
 	admitted := false
@@ -156,8 +166,25 @@ func CloneSandbox(ctx context.Context, opts infra.CloneSandboxOptions, cache inf
 		return
 	}
 
+	// Resolve the per-sandbox runtime transport once for the runtime calls below
+	// (re-init handshake and CSI mounts). This MUST run after the wait-ready gate
+	// so the cloned sandbox already advertises the capabilities of the pod that
+	// actually runs it: a checkpoint does not carry the runtime TLS port
+	// annotation, so the clone only gets it when the controller stamps it while
+	// creating the pod, and cloneWaitSandboxReady refreshes this object. Resolving
+	// any earlier reads a pre-stamp snapshot and silently selects plaintext for a
+	// TLS-only runtime. A resolution failure means the sandbox declares the TLS
+	// capability while this manager cannot honor it, which is a configuration
+	// error: surface it instead of silently downgrading to plaintext.
+	rtOpts, rtErr := runtime.TransportOptionsFor(sbx.Sandbox, opts.RuntimeTLSBundle)
+	if rtErr != nil {
+		log.Error(rtErr, "failed to resolve runtime transport")
+		err = rtErr
+		return
+	}
+
 	// Step 5: re-init runtime
-	if metrics, err = cloneReInitRuntime(ctx, sbx, opts, initRuntimeOpts, metrics); err != nil {
+	if metrics, err = cloneReInitRuntime(ctx, sbx, opts, initRuntimeOpts, metrics, rtOpts...); err != nil {
 		if !wait.Interrupted(err) {
 			err = retriableError{Message: fmt.Sprintf("failed to init runtime: %s", err)}
 		}
@@ -166,9 +193,11 @@ func CloneSandbox(ctx context.Context, opts infra.CloneSandboxOptions, cache inf
 
 	// Step 6: process security token
 	// Issue and propagate the identity-provider security token before performing
-	// CSI mounts, mirroring the claim flow ordering.
+	// access-token issuance and CSI mounts, mirroring the claim flow ordering.
+	// rtOpts rides along so the credential is delivered over the same transport
+	// as the re-init handshake.
 	if identity.IsIDTokenRequested(sbx.Sandbox) {
-		metrics.SecurityToken, err = identity.ProcessSandboxToken(ctx, cache.GetClient(), sbx.Sandbox)
+		metrics.SecurityToken, err = identity.ProcessSandboxToken(ctx, cache.GetClient(), sbx.Sandbox, rtOpts...)
 		if err != nil {
 			if !wait.Interrupted(err) {
 				err = retriableError{Message: fmt.Sprintf("security token processing failed: %s", err)}
@@ -178,7 +207,26 @@ func CloneSandbox(ctx context.Context, opts infra.CloneSandboxOptions, cache inf
 		metrics.Total += metrics.SecurityToken
 	}
 
-	// Step 7: csi mount
+	// Step 7: issue traffic access token
+	// Mint a new traffic access token for the cloned sandbox. The token is bound
+	// to the clone's identity and stays only on the transient wrapper returned to
+	// the API layer; it is never persisted to the Sandbox or Checkpoint.
+	if identity.IsAccessTokenRequested(sbx.Sandbox) {
+		start := time.Now()
+		accessResp, issueErr := identity.IssueSandboxAccessToken(ctx, sbx.Sandbox)
+		metrics.TrafficToken = time.Since(start)
+		metrics.Total += metrics.TrafficToken
+		if issueErr != nil {
+			err = issueErr
+			if !wait.Interrupted(err) {
+				err = retriableError{Message: issueErr.Error()}
+			}
+			return
+		}
+		sbx.trafficToken = accessResp
+	}
+
+	// Step 8: csi mount
 	// If opts.CSIMount is not provided from request, try to resolve mount options from sandbox annotation.
 	if opts.CSIMount == nil {
 		var resolveErr error
@@ -190,7 +238,7 @@ func CloneSandbox(ctx context.Context, opts infra.CloneSandboxOptions, cache inf
 	}
 	if opts.CSIMount != nil {
 		log.Info("starting to perform csi mount")
-		metrics.CSIMount, err = runtime.ProcessCSIMounts(ctx, sbx.Sandbox, *opts.CSIMount)
+		metrics.CSIMount, err = traceCSIMounts(ctx, sbx.Sandbox, *opts.CSIMount, rtOpts...)
 		metrics.Total += metrics.CSIMount
 		if err != nil {
 			log.Error(err, "failed to perform csi mount")
@@ -290,13 +338,20 @@ func prepareSandboxFromCheckpoint(ctx context.Context, opts infra.CloneSandboxOp
 		log.Error(err, "failed to get init runtime request")
 		return nil, nil, err
 	}
-	sbx := newSandboxFromTemplate(opts, tmpl, cache)
+	sbx, err := newSandboxFromTemplate(opts, tmpl, cache)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to modify cloned sandbox: %w", err)
+	}
 	if initRuntimeOpts != nil {
 		sbx.Annotations[v1alpha1.AnnotationRuntimeAccessToken] = initRuntimeOpts.AccessToken
 		sbx.Annotations[v1alpha1.AnnotationInitRuntimeRequest] = cp.Annotations[v1alpha1.AnnotationInitRuntimeRequest]
 	}
-	// e.g., copy csi mount config from checkpoint to sandbox obj
+	requestJWTAuth, requestJWTAuthProvided := sbx.Annotations[identity.AnnotationEnableJwtAuth]
 	RestoreAnnotationsFromCheckpoint(cp, sbx.Sandbox)
+	// Explicit clone settings take precedence over values restored from the checkpoint.
+	if requestJWTAuthProvided {
+		sbx.Annotations[identity.AnnotationEnableJwtAuth] = requestJWTAuth
+	}
 	// When the clone request explicitly provides CSI mount configs, they take
 	// precedence over the csi-volume-config restored from the checkpoint. This
 	// keeps the persisted annotation consistent with the mount performed in the
@@ -342,7 +397,7 @@ func cloneWaitSandboxReady(ctx context.Context, sbx *Sandbox, opts infra.CloneSa
 }
 
 // cloneReInitRuntime re-initializes the runtime if needed
-func cloneReInitRuntime(ctx context.Context, sbx *Sandbox, opts infra.CloneSandboxOptions, initRuntimeOpts *config.InitRuntimeOptions, metrics infra.CloneMetrics) (infra.CloneMetrics, error) {
+func cloneReInitRuntime(ctx context.Context, sbx *Sandbox, opts infra.CloneSandboxOptions, initRuntimeOpts *config.InitRuntimeOptions, metrics infra.CloneMetrics, rtOpts ...runtime.Option) (infra.CloneMetrics, error) {
 	log := klog.FromContext(ctx).WithValues("checkpointID", opts.CheckPointID, "step", "5.reInitRuntime")
 	if initRuntimeOpts == nil {
 		return metrics, nil
@@ -350,7 +405,7 @@ func cloneReInitRuntime(ctx context.Context, sbx *Sandbox, opts infra.CloneSandb
 	initRuntimeOpts.ReInit = true
 	log.Info("re-init runtime")
 	var err error
-	metrics.InitRuntime, err = runtime.InitRuntime(ctx, sbx.Sandbox, *initRuntimeOpts, sbx.refreshFunc())
+	metrics.InitRuntime, err = runtime.InitRuntime(ctx, sbx.Sandbox, *initRuntimeOpts, sbx.refreshFunc(), rtOpts...)
 	metrics.Total += metrics.InitRuntime
 	if err != nil {
 		log.Error(err, "failed to init runtime")
@@ -359,8 +414,8 @@ func cloneReInitRuntime(ctx context.Context, sbx *Sandbox, opts infra.CloneSandb
 	return metrics, nil
 }
 
-// newSandboxFromTemplate returns a Sandbox object whose annotations / labels are not nil
-func newSandboxFromTemplate(opts infra.CloneSandboxOptions, tmpl *v1alpha1.SandboxTemplate, cache infracache.Provider) *Sandbox {
+// newSandboxFromTemplate returns a Sandbox object whose annotations and labels are not nil.
+func newSandboxFromTemplate(opts infra.CloneSandboxOptions, tmpl *v1alpha1.SandboxTemplate, cache infracache.Provider) (*Sandbox, error) {
 	tmplCopy := tmpl.DeepCopy()
 	meta := metav1.ObjectMeta{
 		Namespace:   tmplCopy.Namespace,
@@ -388,7 +443,9 @@ func newSandboxFromTemplate(opts infra.CloneSandboxOptions, tmpl *v1alpha1.Sandb
 		},
 	}, cache)
 	if opts.Modifier != nil {
-		opts.Modifier(sbx)
+		if err := opts.Modifier(sbx); err != nil {
+			return nil, terminalMutationError{stage: "modifier", err: err}
+		}
 	}
 	labels := sbx.GetLabels()
 	labels[v1alpha1.LabelSandboxTemplate] = tmplCopy.Name
@@ -402,7 +459,7 @@ func newSandboxFromTemplate(opts infra.CloneSandboxOptions, tmpl *v1alpha1.Sandb
 	annotations[v1alpha1.AnnotationRestoreFrom] = opts.CheckPointID
 	sbx.SetAnnotations(annotations)
 
-	return sbx
+	return sbx, nil
 }
 
 func postProcessClonedSandbox(*v1alpha1.Sandbox) {}
@@ -415,6 +472,9 @@ func createSandboxTemplate(ctx context.Context, c client.Client, tmpl *v1alpha1.
 }
 
 func createCheckpoint(ctx context.Context, c client.Client, cp *v1alpha1.Checkpoint) (*v1alpha1.Checkpoint, error) {
+	// Inject trace context into annotations so the checkpoint-controller
+	// can establish parent-child span relationship.
+	cp.Annotations = tracing.InjectTraceContext(ctx, cp.Annotations)
 	if err := c.Create(ctx, cp); err != nil {
 		return nil, err
 	}
@@ -423,6 +483,9 @@ func createCheckpoint(ctx context.Context, c client.Client, cp *v1alpha1.Checkpo
 
 func CreateCheckpoint(ctx context.Context, sbx *v1alpha1.Sandbox, cache infracache.Provider, opts infra.CreateCheckpointOptions) (string, error) {
 	log := klog.FromContext(ctx).WithValues("sandbox", klog.KObj(sbx))
+	// Resolve the identity from the passed-in CR before any refresh so the
+	// checkpoint records the point-in-time identity the caller referenced.
+	sandboxID := sandboxid.Resolve(sbx)
 
 	// Step 1: Build the Checkpoint with GenerateName. The Checkpoint is the new
 	// owner of the SandboxTemplate; it carries no OwnerReferences itself.
@@ -433,7 +496,7 @@ func CreateCheckpoint(ctx context.Context, sbx *v1alpha1.Sandbox, cache infracac
 			Annotations: map[string]string{
 				v1alpha1.AnnotationInitRuntimeRequest: sbx.Annotations[v1alpha1.AnnotationInitRuntimeRequest],
 				v1alpha1.AnnotationOwner:              sbx.Annotations[v1alpha1.AnnotationOwner],
-				v1alpha1.AnnotationSandboxID:          utils.GetSandboxID(sbx),
+				v1alpha1.AnnotationSandboxID:          sandboxID,
 			},
 			// Labels are for manual selection by users with kubectl.
 			Labels: map[string]string{
@@ -507,7 +570,14 @@ func CreateCheckpoint(ctx context.Context, sbx *v1alpha1.Sandbox, cache infracac
 
 	// Step 3: Wait for the Checkpoint to reach Succeeded.
 	// In the future, we can delete the failed Checkpoint and retry like ClaimSandbox
-	if err = cache.NewCheckpointTask(ctx, cp).Wait(opts.WaitSuccessTimeout); err != nil {
+	// Trace the wait phase as a dedicated span so it only covers the time spent
+	// waiting for the Checkpoint to succeed and records whether the wait failed.
+	waitCtx, waitSpan := tracing.StartManagerSpan(ctx, tracing.SpanManagerWaitForCheckpoint,
+		attribute.String(tracing.AttrCheckpointName, cp.Name),
+	)
+	err = cache.NewCheckpointTask(waitCtx, cp).Wait(opts.WaitSuccessTimeout)
+	tracing.EndSpan(waitCtx, waitSpan, err)
+	if err != nil {
 		log.Error(err, "failed to wait checkpoint ready")
 		return "", fmt.Errorf("failed to wait checkpoint ready: %w", err)
 	}

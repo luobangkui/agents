@@ -33,14 +33,18 @@ import (
 	"github.com/openkruise/agents/pkg/agent-runtime/storages"
 	"github.com/openkruise/agents/pkg/cache"
 	"github.com/openkruise/agents/pkg/identity"
-	"github.com/openkruise/agents/pkg/proxy"
 	"github.com/openkruise/agents/pkg/sandbox-manager/errors"
 	"github.com/openkruise/agents/pkg/sandbox-manager/infra"
+	"github.com/openkruise/agents/pkg/sandboxid"
+	"github.com/openkruise/agents/pkg/sandboxroute"
+	"github.com/openkruise/agents/pkg/tracing"
 	"github.com/openkruise/agents/pkg/utils"
 	"github.com/openkruise/agents/pkg/utils/expectations"
 	"github.com/openkruise/agents/pkg/utils/proxyutils"
 	"github.com/openkruise/agents/pkg/utils/runtime"
 	"github.com/openkruise/agents/pkg/utils/timeout"
+
+	"go.opentelemetry.io/otel/attribute"
 )
 
 // ModifierFunc mutates the sandbox and decides whether retryUpdate should persist it.
@@ -55,10 +59,22 @@ type Sandbox struct {
 	Cache           cache.Provider
 	storageRegistry storages.VolumeMountProviderRegistry
 	// trafficToken holds the access token response minted for accessing this
-	// sandbox through the sandbox gateway. It is transient and per-claim: set in
-	// memory during runClaimPostProcesses and never persisted to the CR, so
+	// sandbox through the sandbox gateway. It is transient and per-operation: set
+	// in memory during claim or clone and never persisted to the CR, so
 	// InplaceRefresh / retryUpdate reassigning s.Sandbox do not clear it.
 	trafficToken *identity.TokenResponse
+}
+
+func (s *Sandbox) GetIP() string {
+	return s.Status.PodInfo.PodIP
+}
+
+func (s *Sandbox) GetSandboxID() string {
+	return sandboxid.Resolve(s.Sandbox)
+}
+
+func (s *Sandbox) GetRoute() (sandboxroute.Route, error) {
+	return sandboxroute.RouteFromSandbox(s.Sandbox)
 }
 
 var DefaultDeleteSandbox = deleteSandbox
@@ -121,9 +137,13 @@ func (s *Sandbox) retryUpdate(ctx context.Context, modifier ModifierFunc) (bool,
 	objectKey := client.ObjectKeyFromObject(s.Sandbox)
 	updated := false
 	first := true
-	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+	var attemptErr error
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() (err error) {
+		defer func() { attemptErr = err }()
+		if err = ctx.Err(); err != nil {
+			return err
+		}
 		latest := &agentsv1alpha1.Sandbox{}
-		var err error
 		if first {
 			err = s.Cache.GetClient().Get(ctx, objectKey, latest)
 		} else {
@@ -140,10 +160,17 @@ func (s *Sandbox) retryUpdate(ctx context.Context, modifier ModifierFunc) (bool,
 			return err
 		}
 		if !shouldUpdate {
-			s.Sandbox = latest
+			// The informer view may lag behind writes made earlier in the same
+			// operation; never roll the wrapper back to an older object.
+			if expectations.IsResourceVersionNewer(s.Sandbox.ResourceVersion, latest.ResourceVersion) {
+				s.Sandbox = latest
+			}
 			updated = false
 			return nil
 		}
+		// Inject trace context into annotations before updating so the
+		// sandbox-controller can establish parent-child span relationship.
+		copied.Annotations = tracing.InjectTraceContext(ctx, copied.Annotations)
 		if err = s.Cache.GetClient().Update(ctx, copied); err != nil {
 			return err
 		}
@@ -152,6 +179,12 @@ func (s *Sandbox) retryUpdate(ctx context.Context, modifier ModifierFunc) (bool,
 		updated = true
 		return nil
 	})
+	if err == nil && attemptErr != nil {
+		// retry.OnError rewrites wait.Interrupted errors (context cancellation
+		// included) to the last conflict, which is nil when no conflict
+		// happened; restore the real cause instead of reporting success.
+		err = attemptErr
+	}
 	if err != nil {
 		log.Error(err, "failed to update sandbox after retries")
 		return false, err
@@ -173,10 +206,33 @@ func (s *Sandbox) refreshFromAPIReader(ctx context.Context) error {
 	return nil
 }
 
-func (s *Sandbox) Kill(ctx context.Context) error {
+func (s *Sandbox) Kill(ctx context.Context) (err error) {
 	if s.GetDeletionTimestamp() != nil {
 		return nil
 	}
+
+	ctx, span := tracing.StartManagerSpan(ctx, tracing.SpanInfraKill,
+		attribute.String(tracing.AttrSandboxName, s.Name),
+	)
+	// Keep the closure: a direct defer tracing.EndSpan(ctx, span, err) would
+	// evaluate err while still nil and record every failure as success.
+	defer func() { tracing.EndSpan(ctx, span, err) }()
+
+	// Inject trace context before deletion so the controller's terminating
+	// Reconcile can establish a parent-child trace relationship. The whole
+	// block is guarded by HasInjectableTraceContext so the deletion path has
+	// zero extra cost (no DeepCopy, no Patch) when tracing is disabled or no
+	// span is active. The patched object is built from a DeepCopy so the
+	// shared s.Sandbox is never mutated. Patch failure is non-fatal: trace loss
+	// is acceptable, deletion must proceed unconditionally.
+	if tracing.HasInjectableTraceContext(ctx) {
+		patched := s.Sandbox.DeepCopy()
+		patched.Annotations = tracing.InjectTraceContext(ctx, patched.Annotations)
+		if err := s.Cache.GetClient().Patch(ctx, patched, client.MergeFrom(s.Sandbox)); err != nil {
+			klog.FromContext(ctx).Error(err, "failed to inject trace context before deletion")
+		}
+	}
+
 	return DefaultDeleteSandbox(ctx, s.Sandbox, s.Cache.GetClient())
 }
 
@@ -186,6 +242,8 @@ func (s *Sandbox) TriggerRecycle(ctx context.Context) error {
 		s.Sandbox.Annotations = make(map[string]string, 1)
 	}
 	s.Sandbox.Annotations[agentsv1alpha1.AnnotationCleanup] = agentsv1alpha1.True
+	// Inject trace context so the controller's recycle Reconcile is linked.
+	s.Sandbox.Annotations = tracing.InjectTraceContext(ctx, s.Sandbox.Annotations)
 	return s.Cache.GetClient().Patch(ctx, s.Sandbox, patch)
 }
 
@@ -197,11 +255,7 @@ func (s *Sandbox) Phase() string {
 	return string(s.Sandbox.Status.Phase)
 }
 
-func (s *Sandbox) GetSandboxID() string {
-	return utils.GetSandboxID(s.Sandbox)
-}
-
-// GetTrafficAccessToken returns the transient access token minted during claim
+// GetTrafficAccessToken returns the transient access token minted during claim or clone
 // for accessing this sandbox through the sandbox gateway. It is empty unless
 // the sandbox opted in via AnnotationEnableJwtAuth.
 func (s *Sandbox) GetTrafficAccessToken() string {
@@ -212,17 +266,13 @@ func (s *Sandbox) GetTrafficAccessToken() string {
 }
 
 // GetTrafficAccessTokenExpiration returns the expiration time (RFC3339) of the
-// transient traffic token minted during claim. It is empty unless the sandbox
+// transient traffic token minted during claim or clone. It is empty unless the sandbox
 // opted in via AnnotationEnableJwtAuth.
 func (s *Sandbox) GetTrafficAccessTokenExpiration() string {
 	if s.trafficToken == nil {
 		return ""
 	}
 	return s.trafficToken.AccessTokenExpiration
-}
-
-func (s *Sandbox) GetRoute() proxy.Route {
-	return proxyutils.DefaultGetRouteFunc(s.Sandbox)
 }
 
 func setTimeout(sbx *agentsv1alpha1.Sandbox, opts timeout.Options) {
@@ -347,7 +397,11 @@ func (s *Sandbox) Request(ctx context.Context, method, path string, port int, bo
 	return proxyutils.DefaultRequestFunc(ctx, s.Sandbox, method, path, port, body)
 }
 
-func (s *Sandbox) Pause(ctx context.Context, opts infra.PauseOptions) error {
+func (s *Sandbox) Pause(ctx context.Context, opts infra.PauseOptions) (err error) {
+	ctx, span := tracing.StartManagerSpan(ctx, tracing.SpanInfraPause)
+	// Keep the closure: a direct defer tracing.EndSpan(ctx, span, err) would
+	// evaluate err while still nil and record every failure as success.
+	defer func() { tracing.EndSpan(ctx, span, err) }()
 	log := klog.FromContext(ctx)
 	if err := s.refreshFromAPIReader(ctx); err != nil {
 		return err
@@ -409,7 +463,11 @@ const postResumeOperationTimeout = 30 * time.Second
 // callers that pass a ctx without a deadline so Resume cannot block forever.
 const resumeWaitMaxTimeout = 10 * time.Minute
 
-func (s *Sandbox) Resume(ctx context.Context, opts infra.ResumeOptions) error {
+func (s *Sandbox) Resume(ctx context.Context, opts infra.ResumeOptions) (err error) {
+	ctx, span := tracing.StartManagerSpan(ctx, tracing.SpanInfraResume)
+	// Keep the closure: a direct defer tracing.EndSpan(ctx, span, err) would
+	// evaluate err while still nil and record every failure as success.
+	defer func() { tracing.EndSpan(ctx, span, err) }()
 	log := klog.FromContext(ctx).WithValues("sandbox", klog.KObj(s.Sandbox))
 
 	if err := s.refreshFromAPIReader(ctx); err != nil {
@@ -514,9 +572,17 @@ func (s *Sandbox) CSIMount(ctx context.Context, driver string, request string) e
 	return runtime.CSIMount(ctx, s.Sandbox, driver, request)
 }
 
-func (s *Sandbox) CreateCheckpoint(ctx context.Context, opts infra.CreateCheckpointOptions) (string, error) {
-	log := klog.FromContext(ctx)
+func (s *Sandbox) CreateCheckpoint(ctx context.Context, opts infra.CreateCheckpointOptions) (checkpointID string, err error) {
+	// Apply defaults before recording span attributes so the recorded timeout
+	// reflects the effective value instead of 0 when the caller leaves it unset.
 	opts = ValidateAndInitCheckpointOptions(opts)
+	ctx, span := tracing.StartManagerSpan(ctx, tracing.SpanInfraCreateCheckpoint,
+		attribute.Float64(tracing.AttrCheckpointDuration, opts.WaitSuccessTimeout.Seconds()),
+	)
+	// Keep the closure: a direct defer tracing.EndSpan(ctx, span, err) would
+	// evaluate err while still nil and record every failure as success.
+	defer func() { tracing.EndSpan(ctx, span, err) }()
+	log := klog.FromContext(ctx)
 	log.Info("create checkpoint options", "options", opts)
 	return CreateCheckpoint(ctx, s.Sandbox, s.Cache, opts)
 }

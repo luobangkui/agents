@@ -1058,7 +1058,8 @@ func TestEnsureSandboxRecycled(t *testing.T) {
 			})
 			csiResetSignalRetryInterval = time.Millisecond
 			var csiWriteCalls int
-			writeRuntimeFileFunc = func(_ context.Context, _ agentsruntime.WriteFileArgs) (agentsruntime.WriteFileResult, error) {
+			writeRuntimeFileFunc = func(_ context.Context, _ agentsruntime.WriteFileArgs,
+				_ ...agentsruntime.Option) (agentsruntime.WriteFileResult, error) {
 				csiWriteCalls++
 				if tt.csiWriteErr != nil {
 					return agentsruntime.WriteFileResult{}, tt.csiWriteErr
@@ -1228,6 +1229,37 @@ func TestResetForPool(t *testing.T) {
 				Spec: agentsv1alpha1.SandboxSetSpec{Replicas: 1},
 			},
 			expectError: "failed to unmarshal updated-metadata-in-claim",
+		},
+		{
+			name: "recycle retires prior delivery ID with crafted cleanup metadata",
+			box: &agentsv1alpha1.Sandbox{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-sandbox",
+					Namespace: "default",
+					Labels: map[string]string{
+						agentsv1alpha1.LabelSandboxPool: "test-pool",
+						agentsv1alpha1.LabelSandboxID:   "short-id",
+						"user-label":                    "user-value",
+					},
+					Annotations: map[string]string{
+						agentsv1alpha1.AnnotationUpdatedMetadataInClaim: mustMarshal(agentsv1alpha1.UpdatedMetadataInClaim{
+							Labels: []string{agentsv1alpha1.LabelSandboxID, "user-label"},
+						}),
+					},
+				},
+			},
+			sbs: &agentsv1alpha1.SandboxSet{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-pool",
+					Namespace: "default",
+					UID:       types.UID("test-uid"),
+				},
+				Spec: agentsv1alpha1.SandboxSetSpec{Replicas: 1},
+			},
+			expectLabels: map[string]string{
+				agentsv1alpha1.LabelSandboxPool:      "test-pool",
+				agentsv1alpha1.LabelSandboxIsClaimed: agentsv1alpha1.False,
+			},
 		},
 	}
 
@@ -2129,7 +2161,8 @@ func TestEnsureCSIResetSignal(t *testing.T) {
 			var calls int
 			var gotPath string
 			var gotContent []byte
-			writeRuntimeFileFunc = func(_ context.Context, args agentsruntime.WriteFileArgs) (agentsruntime.WriteFileResult, error) {
+			writeRuntimeFileFunc = func(_ context.Context, args agentsruntime.WriteFileArgs,
+				_ ...agentsruntime.Option) (agentsruntime.WriteFileResult, error) {
 				calls++
 				gotPath = args.FilePath
 				gotContent = args.Content

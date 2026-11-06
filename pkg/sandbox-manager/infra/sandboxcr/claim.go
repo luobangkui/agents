@@ -18,10 +18,12 @@ package sandboxcr
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"math/rand/v2"
+	"path"
 	"strings"
 	"sync"
 	"time"
@@ -33,6 +35,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/api/validate/content"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/klog/v2"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -43,13 +46,17 @@ import (
 	"github.com/openkruise/agents/pkg/controller/sandboxset"
 	"github.com/openkruise/agents/pkg/identity"
 	"github.com/openkruise/agents/pkg/sandbox-manager/consts"
+	managererrors "github.com/openkruise/agents/pkg/sandbox-manager/errors"
 	"github.com/openkruise/agents/pkg/sandbox-manager/infra"
 	"github.com/openkruise/agents/pkg/sandbox-manager/logs"
 	"github.com/openkruise/agents/pkg/servers/e2b/models"
+	"github.com/openkruise/agents/pkg/tracing"
 	"github.com/openkruise/agents/pkg/utils"
 	"github.com/openkruise/agents/pkg/utils/expectations"
 	"github.com/openkruise/agents/pkg/utils/runtime"
 	timeoututils "github.com/openkruise/agents/pkg/utils/timeout"
+
+	"go.opentelemetry.io/otel/attribute"
 )
 
 var DefaultCleanupTimeout = 30 * time.Second
@@ -69,6 +76,15 @@ func ValidateAndInitClaimOptions(opts infra.ClaimSandboxOptions) (infra.ClaimSan
 	}
 	if opts.Template == "" {
 		return infra.ClaimSandboxOptions{}, fmt.Errorf("template is required")
+	}
+	if opts.RequireFresh && !opts.CreateOnNoStock {
+		return infra.ClaimSandboxOptions{}, fmt.Errorf("require fresh sandbox requires createOnNoStock")
+	}
+	if len(opts.StaticPVCMounts) > 0 && !opts.RequireFresh {
+		return infra.ClaimSandboxOptions{}, fmt.Errorf("static PVC mounts require a fresh sandbox")
+	}
+	if err := validateStaticPVCMounts(opts.StaticPVCMounts); err != nil {
+		return infra.ClaimSandboxOptions{}, err
 	}
 	if opts.CSIMount != nil {
 		// for csi mount, init runtime is required
@@ -108,6 +124,37 @@ func ValidateAndInitClaimOptions(opts infra.ClaimSandboxOptions) (infra.ClaimSan
 		opts.ReserveFailedSandboxFor = ptr.To(DefaultReserveFailedSandboxFor)
 	}
 	return opts, nil
+}
+
+func validateStaticPVCMounts(mounts []infra.StaticPVCMount) error {
+	// This intentionally mirrors the E2B protocol validation as defense in
+	// depth: Infra is also called by non-E2B claim paths and must protect the
+	// Kubernetes mutation boundary from malformed options.
+	claimNames := make(map[string]struct{}, len(mounts))
+	mountPaths := make(map[string]struct{}, len(mounts))
+	for i, mount := range mounts {
+		if errs := validation.IsDNS1123Subdomain(mount.ClaimName); len(errs) > 0 {
+			return fmt.Errorf("static PVC mount %d has invalid claimName %q: %s", i, mount.ClaimName, strings.Join(errs, ", "))
+		}
+		if !path.IsAbs(mount.MountPath) || mount.MountPath == "/" || path.Clean(mount.MountPath) != mount.MountPath {
+			return fmt.Errorf("static PVC mount %d mountPath %q must be a clean absolute path other than /", i, mount.MountPath)
+		}
+		if mount.SubPath != "" {
+			cleaned := path.Clean(mount.SubPath)
+			if path.IsAbs(mount.SubPath) || cleaned != mount.SubPath || cleaned == "." || cleaned == ".." || strings.HasPrefix(cleaned, "../") {
+				return fmt.Errorf("static PVC mount %d subPath %q must be a clean relative path without parent traversal", i, mount.SubPath)
+			}
+		}
+		if _, exists := claimNames[mount.ClaimName]; exists {
+			return fmt.Errorf("static PVC mount %d duplicates claimName %q", i, mount.ClaimName)
+		}
+		if _, exists := mountPaths[mount.MountPath]; exists {
+			return fmt.Errorf("static PVC mount %d duplicates mountPath %q", i, mount.MountPath)
+		}
+		claimNames[mount.ClaimName] = struct{}{}
+		mountPaths[mount.MountPath] = struct{}{}
+	}
+	return nil
 }
 
 // chooseLockString returns the lock string to use for the current attempt.
@@ -163,6 +210,14 @@ func isKnownRejectedSandboxWrite(err error) bool {
 func TryClaimSandbox(ctx context.Context, opts infra.ClaimSandboxOptions, pickCache *sync.Map, cache infracache.Provider,
 	claimLockChannel chan struct{}, createLimiter *rate.Limiter) (claimed infra.Sandbox, metrics infra.ClaimMetrics, err error) {
 	ctx = logs.Extend(ctx, "tryClaimId", uuid.NewString()[:8])
+	// Trace the whole claim attempt as a child span. Use a deferred closure
+	// (instead of defer span.End()) so the total claim duration and the final
+	// error, which are only known at return time, can be attached before ending.
+	ctx, span := tracing.StartManagerSpan(ctx, tracing.SpanInfraClaimSandbox)
+	defer func() {
+		span.SetAttributes(attribute.Float64(tracing.AttrClaimDuration, metrics.Total.Seconds()))
+		tracing.EndSpan(ctx, span, err)
+	}()
 	log := klog.FromContext(ctx)
 
 	select {
@@ -226,7 +281,7 @@ func TryClaimSandbox(ctx context.Context, opts infra.ClaimSandboxOptions, pickCa
 	// Step 2: Modify and lock sandbox. All modifications to be applied to the Sandbox should be performed here.
 	if err = modifyPickedSandbox(sbx, lockType, opts); err != nil {
 		log.Error(err, "failed to modify picked sandbox")
-		err = retriableError{Message: fmt.Sprintf("failed to modify picked sandbox: %s", err)}
+		err = fmt.Errorf("failed to modify picked sandbox: %w", err)
 		return
 	}
 
@@ -309,6 +364,7 @@ func lockPickedSandbox(ctx context.Context, sbx *Sandbox, lockType infra.LockTyp
 func runClaimPostProcesses(ctx context.Context, sbx *Sandbox, lockType infra.LockType, opts infra.ClaimSandboxOptions,
 	cache infracache.Provider, metrics *infra.ClaimMetrics) error {
 	log := klog.FromContext(ctx)
+
 	if lockType == infra.LockTypeCreate || lockType == infra.LockTypeSpeculate || opts.InplaceUpdate != nil {
 		log.Info("should wait for sandbox ready", "inplaceUpdate", opts.InplaceUpdate != nil)
 		var err error
@@ -321,10 +377,26 @@ func runClaimPostProcesses(ctx context.Context, sbx *Sandbox, lockType infra.Loc
 		log.Info("sandbox is ready", "cost", metrics.WaitReady)
 	}
 
+	// Resolve the per-sandbox runtime transport once for both runtime calls
+	// below (init handshake and CSI mounts). This MUST run after the wait-ready
+	// gate so the sandbox already advertises the capabilities of the pod that
+	// actually runs it: the controller stamps AnnotationRuntimeTLSPort before
+	// creating the pod and waitForSandboxReady refreshes this object, so
+	// resolving any earlier reads a pre-stamp snapshot and silently selects
+	// plaintext for a TLS-only runtime. A resolution failure means the sandbox
+	// declares the TLS capability while this manager cannot honor it, which is a
+	// configuration error: return it as non-retriable rather than silently
+	// downgrading to plaintext.
+	rtOpts, err := runtime.TransportOptionsFor(sbx.Sandbox, opts.RuntimeTLSBundle)
+	if err != nil {
+		log.Error(err, "failed to resolve runtime transport")
+		return err
+	}
+
 	if opts.InitRuntime != nil {
 		log.Info("starting to init runtime", "opts", opts.InitRuntime)
 		var err error
-		metrics.InitRuntime, err = runtime.InitRuntime(ctx, sbx.Sandbox, *opts.InitRuntime, sbx.refreshFunc())
+		metrics.InitRuntime, err = runtime.InitRuntime(ctx, sbx.Sandbox, *opts.InitRuntime, sbx.refreshFunc(), rtOpts...)
 		if err != nil {
 			log.Error(err, "failed to init runtime")
 			return retriableError{Message: fmt.Sprintf("failed to init runtime: %s", err)}
@@ -345,7 +417,9 @@ func runClaimPostProcesses(ctx context.Context, sbx *Sandbox, lockType infra.Loc
 	// injected by modifyPickedSandbox.
 	if identity.IsIDTokenRequested(sbx.Sandbox) {
 		var err error
-		metrics.SecurityToken, err = identity.ProcessSandboxToken(ctx, cache.GetClient(), sbx.Sandbox)
+		// rtOpts rides along so the credential is delivered over the same transport
+		// the /init handshake and the CSI mounts use.
+		metrics.SecurityToken, err = identity.ProcessSandboxToken(ctx, cache.GetClient(), sbx.Sandbox, rtOpts...)
 		if err != nil {
 			return retriableError{Message: fmt.Sprintf("failed to process security token: %s", err)}
 		}
@@ -385,7 +459,7 @@ func runClaimPostProcesses(ctx context.Context, sbx *Sandbox, lockType infra.Loc
 		// sandbox-runtime-storage still enforce the configured per-mount
 		// timeout.
 		mountCtx := csiMountContext(ctx)
-		metrics.CSIMount, err = runtime.ProcessCSIMounts(mountCtx, sbx.Sandbox, *opts.CSIMount)
+		metrics.CSIMount, err = traceCSIMounts(mountCtx, sbx.Sandbox, *opts.CSIMount, rtOpts...)
 		if err != nil {
 			log.Error(err, "failed to perform csi mount")
 			return fmt.Errorf("failed to perform csi mount: %s", err)
@@ -497,6 +571,10 @@ func pickAnAvailableSandbox(ctx context.Context, opts infra.ClaimSandboxOptions,
 	template, cnt := opts.Template, opts.CandidateCounts
 	ctx = logs.Extend(ctx, "action", "pickAnAvailableSandbox")
 	log := klog.FromContext(ctx).WithValues("template", template).V(utils.DebugLogLevel)
+	if opts.RequireFresh {
+		log.Info("will create a fresh sandbox", "reason", "RequestRequiresFresh")
+		return newSandboxFromSandboxSet(ctx, opts, cache)
+	}
 	objects, err := cache.ListSandboxesInPool(ctx, infracache.ListSandboxesInPoolOptions{Namespace: opts.Namespace, Pool: template})
 	if err != nil {
 		return nil, "", err
@@ -663,12 +741,91 @@ func newSandboxFromSandboxSet(ctx context.Context, opts infra.ClaimSandboxOption
 		}
 	}
 	sbx := sandboxset.NewSandboxFromSandboxSet(sbs, refTemplate)
+	if len(opts.StaticPVCMounts) > 0 {
+		if refTemplate != nil {
+			if refTemplate.Spec.Template == nil {
+				return nil, "", managererrors.NewError(managererrors.ErrorBadRequest, "cannot inject static PVC mounts: referenced sandbox template has no pod template")
+			}
+			sbx.Spec.Template = refTemplate.Spec.Template.DeepCopy()
+			sbx.Spec.TemplateRef = nil
+		}
+		if err := injectStaticPVCMounts(sbx, opts.StaticPVCMounts); err != nil {
+			return nil, "", managererrors.NewError(managererrors.ErrorBadRequest, "cannot inject static PVC mounts: %s", err)
+		}
+	}
 	// sandbox manager creates high-priority sandbox
 	sbx.Annotations[v1alpha1.SandboxAnnotationPriority] = "100"
 	for _, anno := range FilteredAnnotationsOnCreation {
 		delete(sbx.Annotations, anno)
 	}
 	return AsSandbox(sbx, cache), infra.LockTypeCreate, nil
+}
+
+func injectStaticPVCMounts(sbx *v1alpha1.Sandbox, mounts []infra.StaticPVCMount) error {
+	if sbx.Spec.Template == nil {
+		return errors.New("sandbox pod template is missing")
+	}
+	if len(sbx.Spec.Template.Spec.Containers) == 0 {
+		return errors.New("sandbox pod template has no containers")
+	}
+
+	containerIndex := 0
+	for i := range sbx.Spec.Template.Spec.Containers {
+		if sbx.Spec.Template.Spec.Containers[i].Name == "sandbox" {
+			containerIndex = i
+			break
+		}
+	}
+	container := &sbx.Spec.Template.Spec.Containers[containerIndex]
+	existingVolumeNames := make(map[string]struct{}, len(sbx.Spec.Template.Spec.Volumes))
+	existingClaimNames := make(map[string]struct{}, len(sbx.Spec.Template.Spec.Volumes))
+	for _, volume := range sbx.Spec.Template.Spec.Volumes {
+		existingVolumeNames[volume.Name] = struct{}{}
+		if volume.PersistentVolumeClaim != nil {
+			existingClaimNames[volume.PersistentVolumeClaim.ClaimName] = struct{}{}
+		}
+	}
+	existingMountPaths := make(map[string]struct{}, len(container.VolumeMounts))
+	for _, mount := range container.VolumeMounts {
+		existingMountPaths[mount.MountPath] = struct{}{}
+	}
+
+	for _, mount := range mounts {
+		volumeName := staticPVCVolumeName(mount.ClaimName)
+		if _, exists := existingVolumeNames[volumeName]; exists {
+			return fmt.Errorf("volume name %q conflicts with the sandbox template", volumeName)
+		}
+		if _, exists := existingClaimNames[mount.ClaimName]; exists {
+			return fmt.Errorf("PVC %q is already referenced by the sandbox template", mount.ClaimName)
+		}
+		if _, exists := existingMountPaths[mount.MountPath]; exists {
+			return fmt.Errorf("mount path %q conflicts with the sandbox container", mount.MountPath)
+		}
+
+		sbx.Spec.Template.Spec.Volumes = append(sbx.Spec.Template.Spec.Volumes, corev1.Volume{
+			Name: volumeName,
+			VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+				ClaimName: mount.ClaimName,
+				ReadOnly:  mount.ReadOnly,
+			}},
+		})
+		container.VolumeMounts = append(container.VolumeMounts, corev1.VolumeMount{
+			Name:      volumeName,
+			MountPath: mount.MountPath,
+			SubPath:   mount.SubPath,
+			ReadOnly:  mount.ReadOnly,
+		})
+		existingVolumeNames[volumeName] = struct{}{}
+		existingClaimNames[mount.ClaimName] = struct{}{}
+		existingMountPaths[mount.MountPath] = struct{}{}
+	}
+	delete(sbx.Annotations, v1alpha1.AnnotationCleanupEnabled)
+	return nil
+}
+
+func staticPVCVolumeName(claimName string) string {
+	digest := sha256.Sum256([]byte(claimName))
+	return fmt.Sprintf("static-pvc-%x", digest[:8])
 }
 
 func preCheckCandidate(sbx *v1alpha1.Sandbox) error {
@@ -688,7 +845,9 @@ func modifyPickedSandbox(sbx *Sandbox, lockType infra.LockType, opts infra.Claim
 	}
 
 	if opts.Modifier != nil {
-		opts.Modifier(sbx)
+		if err := opts.Modifier(sbx); err != nil {
+			return terminalMutationError{stage: "modifier", err: err}
+		}
 	}
 	if opts.InplaceUpdate != nil {
 		if opts.InplaceUpdate.Image != "" {
@@ -762,6 +921,9 @@ func createSandbox(ctx context.Context, sbx *v1alpha1.Sandbox, c client.Client) 
 		return nil, fmt.Errorf("%w: %w", errSandboxCreateNotAttempted, ctx.Err())
 	default:
 	}
+	// Inject trace context into annotations before creating so the
+	// sandbox-controller can establish parent-child span relationship.
+	sbx.Annotations = tracing.InjectTraceContext(ctx, sbx.Annotations)
 	err := c.Create(ctx, sbx)
 	if err != nil {
 		return nil, err

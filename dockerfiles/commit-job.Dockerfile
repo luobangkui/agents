@@ -16,11 +16,12 @@ COPY client client/
 RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} \
     go build -ldflags "-X main.version=${VERSION}" -a -o commit-job ./cmd/commit-job
 
-# Isolated rebase helper (separate go.mod so agents k8s deps stay untouched)
+# Isolated rebase helper (separate go.mod so agents k8s deps stay untouched).
+# Use committed go.sum (-mod=readonly) for reproducible CI builds.
 COPY tools/commit-rebase/ tools/commit-rebase/
 WORKDIR /workspace/tools/commit-rebase
-RUN go mod tidy && \
-    CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -a -o /workspace/commit-rebase .
+RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} \
+    go build -mod=readonly -a -o /workspace/commit-rebase .
 
 WORKDIR /workspace/nerdctl-builder
 RUN git clone -b ${NERDCTL_BRANCH:-v2.0.0} https://github.com/containerd/nerdctl.git

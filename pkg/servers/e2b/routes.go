@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	corev1 "k8s.io/api/core/v1"
@@ -29,6 +30,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/metrics"
 
+	"github.com/openkruise/agents/pkg/sandboxid"
 	"github.com/openkruise/agents/pkg/servers/e2b/adapters"
 	"github.com/openkruise/agents/pkg/servers/e2b/keys"
 	"github.com/openkruise/agents/pkg/servers/e2b/models"
@@ -67,10 +69,11 @@ func (sc *Controller) registerRoutes() {
 	RegisterE2BRoute(sc.mux, http.MethodGet, "/debug", sc.Debug, sc.CheckApiKey)
 
 	// Volume management endpoints
-	RegisterE2BRoute(sc.mux, http.MethodPost, "/volumes", sc.CreateVolume, sc.CheckApiKey)
-	RegisterE2BRoute(sc.mux, http.MethodGet, "/volumes", sc.ListVolumes, sc.CheckApiKey)
-	RegisterE2BRoute(sc.mux, http.MethodGet, "/volumes/{volumeID}", sc.GetVolume, sc.CheckApiKey)
-	RegisterE2BRoute(sc.mux, http.MethodDelete, "/volumes/{volumeID}", sc.DeleteVolume, sc.CheckApiKey)
+	// Temporarily disabled.
+	// RegisterE2BRoute(sc.mux, http.MethodPost, "/volumes", sc.CreateVolume, sc.CheckApiKey)
+	// RegisterE2BRoute(sc.mux, http.MethodGet, "/volumes", sc.ListVolumes, sc.CheckApiKey)
+	// RegisterE2BRoute(sc.mux, http.MethodGet, "/volumes/{volumeID}", sc.GetVolume, sc.CheckApiKey)
+	// RegisterE2BRoute(sc.mux, http.MethodDelete, "/volumes/{volumeID}", sc.DeleteVolume, sc.CheckApiKey)
 
 	// API Keys management endpoints
 	if sc.keyCfg != nil {
@@ -140,7 +143,7 @@ func (sc *Controller) CheckApiKey(ctx context.Context, r *http.Request) (context
 		middleWareLog = middleWareLog.WithValues("volumeID", volumeID)
 		namespace := sc.getNamespaceOfUser(user)
 		if namespace == "" {
-			namespace = sc.systemNamespace
+			namespace = sc.mgrOpts.SystemNamespace
 		}
 		owner, ok := sc.manager.GetOwnerOfVolume(ctx, namespace, volumeID)
 		if !ok {
@@ -263,10 +266,20 @@ func (sc *Controller) CheckDeleteAPIKeyPermission(ctx context.Context, r *http.R
 }
 
 func (sc *Controller) validateTeamNamespace(ctx context.Context, teamName string) *web.ApiError {
-	if err := utils.ValidateNamespaceForSandboxID(teamName); err != nil {
+	if teamName == "" {
 		return &web.ApiError{
 			Code:    http.StatusBadRequest,
-			Message: err.Error(),
+			Message: "namespace must not be empty",
+		}
+	}
+	if strings.Contains(teamName, sandboxid.LegacySeparator) {
+		return &web.ApiError{
+			Code: http.StatusBadRequest,
+			Message: fmt.Sprintf(
+				"namespace %q must not contain %q: this sequence is reserved as the sandbox ID separator",
+				teamName,
+				sandboxid.LegacySeparator,
+			),
 		}
 	}
 	namespace := &corev1.Namespace{}
